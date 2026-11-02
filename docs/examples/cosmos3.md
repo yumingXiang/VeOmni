@@ -207,42 +207,31 @@ loading the VAE parameters. This is the faster path whenever the same data is tr
 for more than a few hundred steps.
 
 ```shell
-# stage 1 -- fill the cache (one-off, resumable). Writes, under
-# data.offline_embedding_save_dir: rank_<r>_shard_<i>.parquet + latent_cache/
+# stage 1 -- fill the cache (resumable) into data.offline_embedding_save_dir:
+#   rank_<r>_shard_<i>.parquet, latent_cache/ and .latent_cache_manifest.json
 bash train.sh tasks/train_dit.py configs/dit/cosmos3_sft_embedding.yaml
 
-# stage 2 -- train from the parquet files only
-mkdir -p "$LATENT_SHARDS"
-cp "$OFFLINE_EMBEDDING_DIR"/*.parquet "$LATENT_SHARDS"/
-#   ...and set data.train_path: $LATENT_SHARDS in configs/dit/cosmos3_sft_offline.yaml
+# stage 2 -- data.train_path points at that same directory
 bash train.sh tasks/train_dit.py configs/dit/cosmos3_sft_offline.yaml
 ```
 
-Four things that must hold:
+Things that must hold:
 
-1. `data.train_path` must point at a directory holding **only** parquet. The cache
-   root also holds `latent_cache_manifest.json`, and mixing file types raises
-   `ValueError: Mixed data file types under ...`.
-2. `data.datasets_type` must be `mapping`.
-3. Do not pass `--data.train_size`: the dyn-bsz step count reads it as a *total
+1. `data.datasets_type` must be `mapping`.
+2. Do not pass `--data.train_size`: the dyn-bsz step count reads it as a *total
    token count*, not a sample count. The yaml default (`1e12`) is correct.
-4. Keep the `vae/` directory in place. Stage 2 does not load the VAE *parameters*, but
-   it still reads `vae/config.json` and the cache recipe hashes the VAE weight files:
-   deleting them changes the recipe digest and stage 2 refuses the cache with
-   `LatentCacheMismatch`.
+3. Keep the `vae/` directory in place. Stage 2 does not load the VAE *parameters*, but
+   it reads `vae/config.json`, and the cache recipe hashes the VAE weight files.
 
-Stage 2 runs `max_steps` steps over the cache, **cycling the data** as needed
-(`DynamicBatchSizeDataLoader` re-iterates when it runs out). `num_train_epochs: 1` does
-not mean "one pass over the cache"; with 1222 clips and 2 packs per rank per step, a
-500-step run replays the dataset many times.
+Stage 2 runs `max_steps` steps over the cache, **cycling the data** as needed;
+`num_train_epochs: 1` does not mean "one pass over the cache".
 
 The cache is content-addressed: every row is keyed by a SHA-256 over the clip
-bytes, the prompt, the geometry handed to the VAE, the VAE dtype/weights,
-the temporal chunking, the source files that implement the encoder, and the
-chat template. A re-run skips every sample whose key is already present, and
-`offline_training` refuses a directory whose manifest records a different recipe
-rather than training on latents it cannot reproduce. Editing the encoder source or the
-chat template therefore invalidates an existing cache — by design.
+bytes, the prompt, the geometry handed to the VAE and a run-level recipe (VAE
+dtype, weights and statistics, chat template, latent grid and a schema version
+bumped whenever the encoding code changes). A re-run skips every sample whose key
+is already present, and `offline_training` refuses a directory whose
+`.latent_cache_manifest.json` records a different recipe.
 
 ## 6. Packed batching
 
@@ -270,9 +259,10 @@ per-sample length function and the grouping rule.
 - **Ulysses sequence parallelism** is refused by joint attention: both attention
   passes span whole token groups, so an SP run would have to rebuild the two
   K/V concatenations per rank slice first.
-- **Sparse-MoE feed-forwards** are not priced by the FLOPs estimator (no released
-  Cosmos3 checkpoint is sparse), so MFU is skipped rather than guessed for such a
-  config.
+- **Sparse-MoE feed-forwards**: no released Cosmos3 checkpoint is sparse, so only
+  dense blocks are built.
+- **MFU**: the shared FLOPs estimator does not price the two-tower layout; derive it
+  from the logged step time and the 720,896 tokens/step.
 - **Autoregressive training of the reasoner tower**: joint training fine-tunes it
   through the diffusion loss only; there is no next-token loss, and `lm_head`
   stays frozen.

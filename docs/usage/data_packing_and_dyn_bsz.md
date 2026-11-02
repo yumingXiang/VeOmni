@@ -130,71 +130,23 @@ Examples (data level):
 
 ## DiT (diffusion) packing
 
-### Why a DiT reuses only half of this machinery
-
-`PackingCollator` packs **1-D token streams** and derives `cu_seq_lens` from
-`position_ids == 0`. A DiT sample is not one: it is a `[C, T, H, W]` latent whose
-geometry differs per clip, its prompt is tokenized *after* the dataloader (by the
-condition model), and the model's two attention passes need two different segment
-layouts. So the **tensor-level** pack lives in the model
-(`veomni/models/diffusers/cosmos3/cosmos3_core/packed_layout.py`: per-sample `cu_seqlens`
-+ `Cosmos3MoTTransformer._forward_packed`), and only the **grouping** half is reused:
-`DynBszBuffer` / `TextBatchingStrategy` / `DynamicBatchSizeDataLoader` decide how
-many samples share a micro-batch, exactly as they do for text. The DiT-specific piece
-the grouping needs is a per-sample length function
-(`veomni/data/multimodal/dit/packing.py::dit_packed_length`), because the shared
-fallbacks price a DiT sample (no `attention_mask`, no `input_ids` yet) as one token.
-
-### Turning it on
+`DiTTrainer` groups samples by token budget with `data.pack_mode: token_budget`
+(the default `mbs` keeps a fixed `micro_batch_size` samples per micro batch):
 
 ```yaml
 data:
-  pack_mode: token_budget              # "mbs" (default) or "token_budget"
-  max_num_tokens_after_packing: 45056  # token budget of one packed micro batch
+  pack_mode: token_budget
+  max_num_tokens_after_packing: 45056  # token budget of one micro batch
 train:
-  micro_batch_size: 1                  # counts packed micro batches in token_budget mode
-  global_batch_size: 16
-  dyn_bsz: true                        # required by token_budget mode
+  micro_batch_size: 1                  # required in token_budget mode
+  dyn_bsz: true
 ```
 
-`mbs` is the default and is what every run had before this existed: a fixed
-`micro_batch_size` samples per micro-batch, `global_batch_size` counting samples.
-`token_budget` is the open-source Cosmos3 `PackingDataLoader` semantics: samples are
-greedily appended until the next one would cross `max_num_tokens_after_packing`, so
-`micro_batch_size` counts *packed micro batches* (keep it 1) and `global_batch_size`
-counts micro batches. `train.gradient_accumulation_steps` is still derived from
-`global_batch_size // (micro_batch_size * dp_size)`; there is no `grad_accum` field.
-The model-side switch `config.pack_samples` (`auto` / `always` / `never`) is separate:
-`auto` runs any multi-sample micro-batch as one packed sequence, `never` keeps the
-one-forward-per-sample loop.
-
-### `dyn_bsz_length_fn`: what a new modality must provide
-
-`build_native_dataloader(..., dyn_bsz_length_fn=None)` is the injection point added
-for this: a picklable callable returning **how many tokens the sample costs under the
-token budget**. `None` (the default) keeps
-`get_length_fn_by_count_mode(dyn_bsz_count_mode)`, i.e. today's behaviour for every
-existing pipeline. A modality whose samples do not look like token ids must pass its
-own; the DiT one is built from the run's own declarations
-(`build_dit_length_fn(mm_configs, model_config=...)`) and mirrors the open-source
-`SampleTokenCounter`: prompt tokens `+ 1`, plus
-`ceil(h_lat / patch) * ceil(w_lat / patch) * t_lat + 2`. Its **text term is an
-estimate** (characters / `pack_text_chars_per_token`) until the prompt is tokenized,
-so the grouping can differ from a tokenizer-exact packer by a couple of percent of a
-sample.
-
-### Things to watch
-
-* `num_micro_batch = global_batch_size // (micro_batch_size * dp_size)`, and every
-  packed micro batch is filled to the token budget -- so tokens/step is
-  `num_micro_batch * max_num_tokens_after_packing * world_size` regardless of how
-  many clips that turns out to be (16 x 45056 = 720,896 for 8 ranks, `global=16`,
-  `micro=1`).
-* Cross-sample isolation is **structural, not mask-based**: each sample's K/V is one
-  contiguous `[und_i ; gen_i]` block (`interleave_und_gen`) and both attention passes
-  take per-segment `cu_seqlens`, while position ids restart per sample. Packing
-  therefore does not add a mask anywhere; it makes leakage unrepresentable.
-* Packed attention is served by `eager` (block-diagonal mask), `sdpa` /
-  `veomni_sdpa` (per-segment split) and the flash rows (one varlen kernel). Any other
-  attention row raises `NotImplementedError` instead of silently attending across the
-  whole pack.
+Only the grouping half of dynamic batching is reused (`DynBszBuffer` /
+`DynamicBatchSizeDataLoader`). `PackingCollator` packs 1-D token streams, while a
+DiT sample is a latent of per-clip geometry, so the tensor-level pack stays in the
+model. The trainer prices samples with the condition model's
+`build_dyn_bsz_length_fn(mm_configs, model_config)`, which reaches the dataloader as
+`build_native_dataloader(..., dyn_bsz_length_fn=...)`; a condition model without it
+cannot use `token_budget`. Cosmos3 is the current user, see
+[its example](../examples/cosmos3.md).

@@ -1,135 +1,28 @@
-# =============================================================================
-# Cosmos3-Nano — vision SFT (T2V) on BridgeData2-Subset-Synthetic-Captions
-# =============================================================================
-#
-# Entry point:  tasks/train_dit.py  (DiTTrainer + VeOmniDiTArguments)
-#   bash train.sh tasks/train_dit.py configs/dit/cosmos3_sft.yaml
-#
-# Aligned with the open-source recipe
-#   cosmos-framework/.agents/skills/cookbooks/cosmos3/generator/audiovisual/
-#     finetune/{launch_sft_vision_nano.sh,toml/sft_config/vision_sft_nano.toml}
-#   cosmos_framework/configs/base/experiment/sft/vision_sft_nano.py
-# so a VeOmni run trains the same objective on the same data:
-#
-#   recipe (open source)                     this config
-#   ---------------------------------------  ----------------------------------
-#   8 ranks x micro-bs 1 x grad_accum 2      global_batch_size 16, micro_batch_size 1
-#   max_iter 500, save_iter 100              train.max_steps 500, save_steps 999999
-#   lr 1e-4, betas (0.9, 0.95), wd 0         model.optimizer.* below
-#   grad_clip 0.1                            model.optimizer.max_grad_norm 0.1
-#   warmup 50 steps, cosine to 0             lr_warmup_ratio 0.1, lr_decay_style cosine
-#   shift 256 -> 3, waver, loss_scale 1      model.condition_model_cfg.shift
-#   conditioning 0.7/0.2/0.1 (T2V/I2V/V2V)   condition_model_cfg.conditioning_config
-#   cfg_dropout_rate 0.1                     data.mm_configs.cfg_dropout_rate
-#   online VAE encode (no latent cache)      train.training_task online_training
-#   max_caption_tokens 2048                  condition_model_cfg.max_sequence_length
-#   PackingDataLoader, 45056 tokens/batch    data.pack_mode token_budget (see below)
-#
-# ── packed batching: the one number that matters ───────────────────────────
-# The recipe runs `micro_bs 1` with `grad_accum 2` on 8 ranks, where a *micro batch*
-# is one packed sequence of at most `max_num_tokens_after_packing = 45056` tokens --
-# not one sample. So a step holds 8 ranks x 2 micro batches x 45056 = **720,896
-# tokens** over a varying number of clips.
-#
-# VeOmni spells the same thing as:
-#   data.pack_mode: token_budget            # greedy pack samples to a token budget
-#   data.max_num_tokens_after_packing: 45056
-#   train.micro_batch_size: 1               # 1 *packed micro batch* (the unit)
-#   train.global_batch_size: 16             # 8 ranks x 2 micro batches
-# `train.gradient_accumulation_steps` is derived (`global / (micro * dp)`) = 2, so it
-# is not a separate field: writing `grad_accum: 2` would be rejected as an unknown
-# key. The token budget reaches the dataloader as `micro_batch_size * max_seq_len`,
-# which is why `max_seq_len` below is the same 45056.
-#
-# `data.pack_mode: mbs` is the other mode: `train.micro_batch_size` then counts
-# *samples* per micro batch, `global_batch_size` must be
-# `num_micro_batch * micro_batch_size * dp_size`, and the pack is capped by whatever
-# those samples add up to (use it for A/B comparisons, not for baseline alignment).
-#
-# Either way the samples are run as ONE packed TND sequence
-# (`model.pack_samples: auto`, the default), never padded to equal length and never
-# one forward per sample.
-#
-# This file is the Ascend 950DT end-to-end run config: paths point at the real
-# Cosmos3-Nano snapshot and BridgeData2 dump on the shared box, and the run is
-# sized to 20 optimizer steps so it can be compared against the 20-step
-# open-source baseline (see BASELINE in the task notes).
-#
-# WHY save_steps=999999: one DCP checkpoint of this job is ~30 GB. The 20-step
-# comparison run needs no checkpoint, and `save_steps` > `max_steps` is how the
-# trainer is told not to write one.
-# =============================================================================
+# Cosmos3-Nano SFT (open-source vision_sft_nano recipe), online: the Wan2.2 VAE encodes inside the step.
+# Joint training of both towers: set model.model_config.train_joint_reasoner: true.
 
 model:
-  # Directory holding the Cosmos3-Nano *transformer* shards (the trainable DiT).
   model_path: pretrained_models/Cosmos3-Nano/transformer
-  # The checkpoint root: the condition model resolves vae/ and the Qwen3-VL
-  # tokenizer relative to it, and `from_pretrained` injects it as base_model_path.
   condition_model_path: pretrained_models/Cosmos3-Nano
-  # Initial values for the transformer config (arch + flow-matching schedule).
-  # Mirrors the released Cosmos3-Nano / Qwen3-VL-8B text tower (hidden 4096, 36
-  # layers, 32 heads / 8 kv heads, head_dim 128, vocab 151936) plus the
-  # generation tower's patch geometry: patch_latent_dim = latent_channel(48) x
-  # latent_patch_size^2(4) = 192, timestep_scale 0.001.
   config_path: configs/model_configs/cosmos3/cosmos3_nano.json
-
-  # Extra kwargs for Cosmos3ConditionModelConfig.from_pretrained(). Only the
-  # online-encoding knobs live here; the schedule values that must match the
-  # open-source recipe are spelled out rather than relied on as defaults.
-  condition_model_cfg:
-    # The reference encodes with a bf16 VAE, and dtype matters more than "precision":
-    # against its own dumped latents, our bf16 agrees to ~0.3% (mean |d| 2.7e-3 on a
-    # latent of std 0.86) while fp32 agrees 5-10x worse (4.2e-3 .. 5.7e-3), because
-    # the reference's bf16 rounding is part of what we are comparing against. Match
-    # its dtype rather than its nominal precision. This is also a latent-cache key
-    # factor, so changing it invalidates an existing cache.
-    vae_dtype: bfloat16
-    resolution: "256"          # recipe trains the 256 bucket
-    num_train_timesteps: 1000  # sigma -> timestep scale for the DiT embedder
-    train_time_video_distribution: "waver"
-    train_time_weight: "uniform"
-    # The open-source `vision_sft_nano` run logs `'loss_scale': 1.0` in its own
-    # config dump, so its printed Loss is the raw flow-matching MSE. Keep the same
-    # value here: otherwise both the logged loss and the backpropagated gradient
-    # are 10x larger than the baseline and the two numbers are not comparable.
-    #
-    # The field is spelled here because that is where the recipe's config files
-    # carry it, but the value is read by the *transformer*:
-    # `Cosmos3MoTTransformerConfig.loss_scale`
-    # (`modeling_cosmos3_transformer.py:900`), which `DiTTrainer` builds from
-    # `model.config_path` + `model.model_config`. `DiTModelRuntime` therefore
-    # forwards this value onto the DiT config (`dit_trainer.py::resolve_loss_scale`)
-    # and logs the effective number once per run. Setting
-    # `model.model_config.loss_scale` instead works too; setting both to different
-    # values is refused.
+  model_config:
     loss_scale: 1.0
+  condition_model_cfg:
+    vae_dtype: bfloat16
+    resolution: "256"
+    num_train_timesteps: 1000
+    train_time_video_distribution: "waver"
     latent_patch_size: 2
-    max_sequence_length: 2048  # recipe's max_caption_tokens
-    # T2V / I2V / V2V mixture, `{clean_prefix_latent_frames: probability}`.
-    # Copied from vision_sft_nano.py:262 ("70% T2V, 20% I2V (first frame), 10% V2V
-    # (first 5 frames / 2 latent frames)"). Weights are re-normalized, so 7/2/1
-    # would be the same mixture. `{0: 1.0}` recovers pure text-to-video.
-    conditioning_config:
-      0: 0.7   # T2V: nothing conditioned
-      1: 0.2   # I2V: latent frame 0 is clean (== the first pixel frame)
-      2: 0.1   # V2V: latent frames 0-1 are clean (== the first 5 pixel frames)
-    # Must stay 1.0: Cosmos3 has no conditioning noise augmentation (the clean
-    # frames enter x_t with sigma = 0 verbatim, posttrain/model/cosmos3.py:1156).
-    # The field exists for parity with the MiniMax-H3 config and is validated.
-    imgvid_cond_noise_aug: 1.0
+    max_sequence_length: 2048
+    conditioning_config:  # clean latent-prefix frames: 70% T2V, 20% I2V, 10% V2V
+      0: 0.7
+      1: 0.2
+      2: 0.1
     shift:
       "256": 3
       "480": 5
       "720": 10
 
-  # No dedicated kernel exists for Cosmos3's two-segment attention yet, so pin
-  # every op to the reference (eager) implementation. For attention that resolves to
-  # the `veomni_sdpa` adapter (`bind_mot_attention(..., eager_as="veomni_sdpa")`),
-  # which is also the row that serves the packed (TND) path: it splits the pack per
-  # sample, so isolation holds on CPU with no extra kernel. A flash row
-  # (`veomni_flash_attention_2`, i.e. `npu_fusion_attention` on Ascend) computes the
-  # whole pack in ONE varlen call and is the throughput setting; it needs real
-  # hardware, which this CPU-only change cannot verify.
   ops_implementation:
     attn_implementation: flash_attention_2
     swiglu_mlp_implementation: eager
@@ -141,163 +34,72 @@ model:
     type: adamw
     lr: 1.0e-4
     lr_min: 0.0
-    # The recipe's `warmup 50 steps` is expressed as a *ratio* (`lr_scheduler.py:84`
-    # computes `int(train_steps * lr_warmup_ratio)`), so it only means 50 steps when
-    # `train.max_steps` is 500. With the 20-step comparison run below it means **2**
-    # steps: our lr reaches 1e-4 at step 2, while the baseline is still inside its
-    # 50-step ramp (2% of peak at step 1, 40% at step 20). A 20-step loss *trajectory*
-    # therefore cannot be compared against the baseline's; only the level can.
     lr_warmup_ratio: 0.1
     lr_decay_style: cosine
     lr_decay_ratio: 1.0
     weight_decay: 0.0
-    max_grad_norm: 0.1         # recipe [trainer.callbacks.grad_clip] clip_norm
+    max_grad_norm: 0.1
     betas: [0.9, 0.95]
 
   accelerator:
     init_device: meta
     ulysses_size: 1
-    # The recipe runs activation_checkpointing.mode="full"; recompute the MoT
-    # blocks so a 45056-token packed sequence fits.
     gradient_checkpointing:
       enable: true
     fsdp_config:
       fsdp_mode: fsdp2
       reshard_after_forward: true
-      # Explicit request: Cosmos3 is pure FSDP2 (tp=1, ulysses=1, empty
-      # extra_parallel_plan), so the *layout* would not ask for the manual
-      # forward/backward prefetch lists -- and without them every block's
-      # ~772 MB all-gather is fully exposed between forward passes instead of
-      # overlapping the previous block's compute. `true` here is what
-      # `resolve_manual_prefetch` honours; leaving the field unset keeps the
-      # structural default, which for this model means no prefetch.
-      forward_prefetch: true
       mixed_precision:
         enable: false
         param_dtype: bfloat16
         reduce_dtype: bfloat16
     offload_config:
       enable_activation: false
-      # The MoT forward calls checkpointing outside block.__call__ (same shape as
-      # Wan), where async activation offload would suppress the recompute.
       enable_async_activation: false
 
 data:
-  # The SFT dump is a JSONL (one row per clip with its `t2w_windows`). VeOmni's
-  # `get_data_files` (veomni/data/dataset.py:1576) accepts `jsonl` directly and
-  # loads it through HF's `json` builder — no parquet conversion is needed.
   train_path: dataset/cosmos3-demo/video_dataset_file.jsonl
-  train_size: 1000000000000    # iterable dump: size the run by train.max_steps
+  train_size: 1000000000000
   datasets_type: iterable
   data_type: diffusion
-  # `data_type: diffusion` has no default for text_keys. The DiT transform reads
-  # the row through the preprocessor, so this only documents the JSONL field the
-  # prompt is built from.
   text_keys: caption
-  # Token budget of one packed micro batch (the recipe's
-  # `model.max_num_tokens_after_packing`). Also used as `max_seq_len`, because the
-  # dataloader derives the packing target from `micro_batch_size * max_seq_len` and
-  # `micro_batch_size` is 1 in `token_budget` mode.
   max_seq_len: 45056
-  pack_mode: token_budget
+  pack_mode: token_budget  # greedy packing to 45056 tokens per micro batch, like the reference
   max_num_tokens_after_packing: 45056
-  # Readiness floor of the token-budget batcher, in samples. The budget is the
-  # real gate; the floor only widens the greedy scan. The inherited text default
-  # is 200, which for video would pin ~200 *decoded clips* in host RAM (tens of
-  # GB) and read 200 clips before step 1. 1 = emit as soon as the budget is met,
-  # which is the reference PackingDataLoader's behaviour.
   pack_buffer_size: 1
   source_name: cosmos3_sft_jsonl
-  data_transform: dit_online
+  data_transform: cosmos3_online
   dataloader:
     type: native
     num_workers: 1
-    # A background thread fetches the next batch while the current step computes,
-    # so the loader wait hides inside the step (measured: data_wait 2138 ms -> 1 ms,
-    # whole step 25.4 s -> 23.0 s).
     use_background_prefetcher: true
     drop_last: true
   mm_configs:
-    # The dataset root that relative `vision_path` values (e.g. "videos/xx.mp4")
-    # resolve against; the preprocessor never decodes, `fetch_videos` does.
     data_dir: dataset/cosmos3-demo
-    fps: 5                       # Bridge clips are 5 fps; sample every frame
+    fps: 5
     min_frames: 5
-    # Frame selection must match the reference reader, which keeps a contiguous
-    # prefix at a fixed stride and drops the tail rather than spreading the interior
-    # frames over the whole clip (video_utils.calculate_frame_indices). With
-    # linspace a clip whose length is not 4k+1 selects a different frame set, which
-    # changes the latent and therefore the loss.
-    frame_selection: prefix
-    # Measured on the real jsonl (1222 rows, 1 t2w_window each, start_frame always
-    # 0): max(end_frame - start_frame + 1) = **117**, p99 = 96, mean 83.6. So 117 is
-    # the alignment `4*floor((max_N-1)/4)+1 = 117`, not a round number. Anything
-    # smaller truncates the four longest clips: at 97 the mean latent-frame count is
-    # 21.110 against the baseline's 21.119 (-0.04%), and the tail clips lose latent
-    # frames (N=106 -> 26 vs 27; N=117 -> 29 vs 30). The earlier 81 was worse
-    # (-6.5% mean) because the cap truncated *before* the 4k+1 alignment.
     max_frames: 117
-    frame_factor: 4              # Wan2.2 VAE: one latent per 4 pixel frames
+    frame_selection: prefix
+    frame_factor: 4
     frame_factor_remainder: 1
-    # CFG dropout, the reference's `cfg_dropout_rate=0.1`
-    # (vision_sft_nano.py:260 -> sft_dataset.py:324-326): one sample in ten trains on
-    # an *empty* caption, which is what teaches the diffusion tower to run without
-    # text. It is a data-layer draw, so it lives here and not on the model: the chat
-    # template / [eos] / <|vision_start|> structure survives, only the caption
-    # content goes (packers.py:510). It uses its own resumable RNG stream
-    # (cosmos3_preprocess.cfg_dropout_rng), deliberately *not* the condition model's
-    # sigma/noise generator, which is the checkpointed one; `cfg_dropout_seed` names
-    # that stream. Set the rate to 0.0 to switch the mechanism off -- that draws
-    # nothing at all, so the pipeline is then bit-identical to the pre-dropout one.
-    cfg_dropout_rate: 0.1        # vision_sft_nano.py:260
-    # The one-shot `helper.print_example` dump writes ~160 lines of raw caption
-    # JSON and tensor reprs to the log on the first micro batch; it is a debugging
-    # aid, not part of the run record.
-    log_sample: false
+    cfg_dropout_rate: 0.1
     cfg_dropout_seed: 42
-    # Bridge rows carry one t2w_window per clip, so the first window is the whole
-    # clip. "random" reproduces the recipe's per-epoch window draw, but only once
-    # the preprocessor also crops the clip to the window's frame range (v1 does
-    # not, so a random multi-window pick could pair a window caption with the
-    # full clip).
     window_selection: first
+    log_sample: false
 
 train:
-  training_task: online_training   # encode the clip on the fly, no latent cache
-  # 8 ranks x 1 packed micro batch x grad_accum 2 = 16 packed micro batches per step,
-  # i.e. 16 x 45056 = 720,896 tokens -- the open-source recipe's step. `grad_accum`
-  # itself is derived from these two numbers (`global / (micro * dp_size)`), not a
-  # field; `micro_batch_size` counts *packed micro batches* under
-  # `data.pack_mode: token_budget`.
+  training_task: online_training
   global_batch_size: 16
   micro_batch_size: 1
-  # Required by `token_budget` mode: it selects VeOmni's token-budget (dyn-bsz)
-  # dataloader, which is the equivalent of the recipe's PackingDataLoader.
   dyn_bsz: true
   bsz_warmup_ratio: 0.0
-  # 500 matches the reference's `max_iter=500`, and that is the whole point: the
-  # recipe expresses its 50-step warmup as a *ratio* (`lr_warmup_ratio: 0.1` below,
-  # `lr_scheduler.py:84` computes `int(train_steps * lr_warmup_ratio)`). At
-  # max_steps=37 that ratio means 3 warmup steps, so our lr reaches peak at step 4
-  # while the baseline is still at 38% of peak at step 20 -- a 4x difference in
-  # cumulative lr over the compared window, which shows up as a *steeper* loss curve
-  # and a lower 20-step mean, not as a different objective. At 500 the ratio yields
-  # exactly 50 steps and the two trajectories become comparable. Only the first 20
-  # steps are compared; `save_steps: 999999` keeps the run from writing anything, and
-  # the run is stopped long before 500 so the epoch-end DCP export never happens.
   max_steps: 500
   num_train_epochs: 1
   seed: 42
   checkpoint:
     output_dir: output/cosmos3_sft
-    save_steps: 999999             # never write a checkpoint (~30 GB DCP each)
-    # save_epochs defaults to 1 in TrainingCheckpointArguments, i.e. an epoch
-    # boundary writes a full DCP shard set (~109 GB for this job). 0 disables it;
-    # the 50-step comparison never reaches an epoch boundary anyway.
+    save_steps: 999999
     save_epochs: 0
-    # A 15B-parameter bf16 export is ~30 GB per rank => ~138 GB on disk for one
-    # 20-step comparison run. Nothing reads it back, so keep it off; turn on only
-    # for a run that actually needs to be reloaded.
     save_hf_weights: false
   wandb:
     enable: false

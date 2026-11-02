@@ -23,15 +23,6 @@ from .device import get_device_name
 logger = logging.get_logger(__name__)
 
 
-# ``config.model_type`` values of the Cosmos3 mixture-of-towers (MoT) DiT family.
-# One checkpoint type stands for *two* towers -- an "und" (understanding / reasoner)
-# tower and a "gen" (diffusion / generation) tower -- that share one attention
-# softmax and nothing else, which is why the dense-LM formulas in this file do not
-# describe it. Exported so the DiT trainer can tell whether its own micro-batch
-# layout is the one these estimators price.
-COSMOS3_MOT_MODEL_TYPES = frozenset({"Cosmos3MoTTransformer"})
-
-
 def get_device_flops(unit="T"):
     """Peak dense BF16 FLOPS of the current device.
 
@@ -41,10 +32,6 @@ def get_device_flops(unit="T"):
     for Blackwell it is the clock the deployed part actually runs at (`nvidia-smi
     --query-gpu=clocks.max.sm`), which is higher than the clock behind the datasheet.
     H20 and 910B are throughput-capped SKUs the formula does not describe.
-
-    Ascend entries are the vendor's published dense BF16 cube peak per chip (nothing
-    in this repository derives them): 910B/910_93 is the 354 TFLOPS SKU already used
-    by every NPU MFU number here, and 950DT / A5 is 432 TFLOPS.
     """
 
     def unit_convert(number, level):
@@ -69,13 +56,6 @@ def get_device_flops(unit="T"):
         flops = 119.5e12
     elif "H20" in device_name:
         flops = 148e12
-    elif "950DT" in device_name or "910_95" in device_name or "Ascend950" in device_name:
-        # Ascend 950DT / Atlas 950 SuperPod node chip (A5 generation).
-        # Source: user-provided hardware specification -- BF16 cube peak, dense, per
-        # chip. 432 TFLOPS x 8 chips is the 3,456 TFLOPS denominator of the
-        # Cosmos3 MFU numbers. Checked before the 910B/910_93 rows below: a 950DT
-        # reports itself as `Ascend910_95...`, which contains neither tag.
-        flops = 432e12
     elif "910B" in device_name or "910_93" in device_name:
         flops = 354e12
     elif "GB200" in device_name:
@@ -130,42 +110,12 @@ class VeomniFlopsCounter:
             "gemma3": self._estimate_gemma3_flops,
             "gemma3_text": self._estimate_gemma3_flops,
         }
-        # The Cosmos3 mixture-of-towers DiT: registered from the module constant so the
-        # trainer's "do I have an estimator for this DiT?" check cannot drift from the
-        # dispatch table below.
-        self.estimate_func.update(dict.fromkeys(COSMOS3_MOT_MODEL_TYPES, self._estimate_cosmos3_mot_flops))
 
         self.config = config
         self._warned_lora_validation_errors = set()
 
     def _estimate_unknown_flops(self, tokens_sum, batch_seqlens, delta_time, **kwargs):
         return 0
-
-    def has_estimator(self, model_type: str | None = None) -> bool:
-        """Whether an estimator is registered for ``model_type`` (default: the config's own)."""
-        return (self.config.model_type if model_type is None else model_type) in self.estimate_func
-
-    def supports_config(self) -> bool:
-        """Whether this counter can actually price *this* config's geometry.
-
-        A family can be registered while a particular config is not described by its
-        estimator: the estimator is expected to raise ``ValueError`` /
-        ``NotImplementedError`` for a layout it does not model (e.g. a mixture-of-experts
-        feed-forward in a family whose estimator only counts dense MLPs). Training
-        metrics must never abort a run, so callers that report MFU as a *diagnostic*
-        ask this once, at construction time, and skip the metric when it is False.
-        """
-        if not self.has_estimator():
-            return False
-        try:
-            # Empty lengths and a unit step: every estimator in this file accepts them,
-            # so this exercises the geometry checks without touching the device table.
-            # ``AttributeError`` covers a config object that is missing a field the
-            # estimator needs -- still "cannot price it", still not a crash.
-            self.estimate_func[self.config.model_type](0, [], 1.0)
-        except (AttributeError, ValueError, NotImplementedError, KeyError, TypeError):
-            return False
-        return True
 
     @staticmethod
     def _compute_lm_head_params(hidden_size, vocab_size):
@@ -550,204 +500,6 @@ class VeomniFlopsCounter:
         )
 
         flops_all_token = linear_flops + mhc_residual_flops + attention_flops + indexer_flops
-        return flops_all_token * (1.0 / delta_time) / 1e12
-
-    @staticmethod
-    def _cosmos3_mot_flops_breakdown(config, und_seqlens, gen_seqlens):
-        """Per-term training FLOPs of one Cosmos3 mixture-of-towers micro batch.
-
-        What makes Cosmos3 different from every other model in this file, and why the
-        dense-LM formula cannot be reused: per layer it runs *two* towers side by side
-        (``MoTDecoderLayer``), each with its own norms, its own Q/K/V/O and its own
-        feed-forward, and each tower's tokens only see their own tower's weights --
-        but both passes are computed on one shared attention softmax, with two
-        different shapes (``cosmos3_core/mot_attention.py::joint_attention``):
-
-        * **reasoner pass** (``und``): causal, own queries against own keys/values, so
-          ``Q = KV = und_len``.
-        * **generation pass** (``gen``): every generation query against the *whole*
-          sample -- ``Q = gen_len`` but ``KV = und_len + gen_len``. This pass is not
-          square, so pricing it as ``gen_len`` (or as ``(und + gen)`` queries) is wrong
-          in either direction.
-
-        Coefficients, and where each one comes from (the same convention the rest of
-        this file uses, so a Cosmos3 MFU is comparable to a Qwen/Llama one):
-
-        * **Linear / MLP: 6 per (weight element x token).** A dense layer is
-          ``2 * in * out`` FLOPs per token forward; a full fine-tune also computes the
-          input gradient and the weight gradient, so forward + backward = 3x forward
-          (``_compute_linear_flops``'s ``6 * base_params * tokens``, and every
-          ``dense_N_flops`` in this file). Applied per tower, on *that tower's* token
-          count: a reasoner token never enters the generation tower's projections and
-          vice versa. The generation tower's K/V projections are ordinary per-token
-          projections too -- their *output length* is ``kv_size`` wide, but the number
-          of rows is ``gen_len``; the ``und_len + gen_len`` length shows up only in the
-          attention core below, as a KV length.
-        * **Attention: 12 per (query x key pair x head x head_dim).** ``Q@K^T`` and
-          ``attn@V`` are ``2 * (2 * Q * KV * head_dim)`` FLOPs per head forward, and
-          3x for forward + backward -> ``12 * Q * KV * head_dim * heads``; exactly the
-          ``12 * seqlen_square_sum * head_dim * num_attention_heads`` term of
-          ``_estimate_llama_flops`` (with ``seqlen_square_sum = Q * KV``). Only the two
-          matmuls are counted: the softmax, the scaling, the masking and the mRoPE
-          rotation are elementwise or reduction work, which no estimator here prices.
-        * **Causal triangle not discounted.** The reasoner pass really only computes
-          the lower triangle, but this file counts the full square for causal attention
-          (``_estimate_llama_flops``, ``_estimate_qwen2_flops``), so Cosmos3 does too,
-          and its und-attention term is an upper bound by ~2x on that one term. Keeping
-          the convention is what makes the number comparable across model families.
-        * **Adapters: 6 per weight element x token.** ``proj_in``
-          (``patch_latent_dim -> hidden``) and ``proj_out`` (``hidden ->
-          patch_latent_dim``) run on generation rows only, and ``time_embedder``'s
-          two-layer MLP (``frequency_embedding_size -> hidden -> hidden``) runs once
-          per *generation row*: ``add_time_conditioning`` is applied to the packed rows,
-          with one sigma per row, so the embedder's cost scales with ``gen_len`` too.
-        * **Excluded, deliberately.** ``embed_tokens`` is a table lookup (same reason
-          ``_compute_lm_head_params`` ignores it); ``lm_head`` is never in the graph
-          (v1 trains no autoregressive loss, see ``Cosmos3MoTTransformer``); RMSNorm,
-          residual adds, the sinusoidal feature construction and ``patchify_latent``
-          are elementwise / reshape work; the VAE and the condition model run under
-          ``torch.no_grad()`` in ``DiTTrainer.forward_backward_step`` and are not part
-          of the training FLOPs of the DiT.
-        * **Frozen reasoner.** ``config.train_joint_reasoner=False`` (the SFT recipe)
-          freezes the reasoner tower, so its backward never runs while its forward
-          always does (the generation pass attends its K/V). The reasoner terms are
-          therefore counted at forward-only weight (2 and 4 instead of 6 and 12), the
-          same distinction upstream's FLOPs tool draws with ``freeze_und``
-          (``cosmos_framework/tools/flops/omni_mot.py:480``). A frozen run and a joint
-          run of the same geometry then report comparable MFU, and the difference
-          between them is the extra work joint training really does.
-
-        Args:
-            config: A ``Cosmos3MoTTransformerConfig``-shaped object.
-            und_seqlens: Prompt-token counts, one entry per attention segment (a
-                packed micro batch holds several isolated samples, so per-sample
-                lengths are required -- the caveat is that attention is quadratic).
-            gen_seqlens: Latent patch-row counts, one entry per segment, in the same
-                order. Entry ``i``'s generation pass attends ``gen_seqlens[i]``
-                queries to ``und_seqlens[i] + gen_seqlens[i]`` keys/values.
-
-        Returns:
-            ``dict[str, float]`` of forward+backward FLOPs per term (not divided by
-            time). The keys are the ones the tests assert on:
-            ``und_attn``, ``gen_attn``, ``und_attn_proj``, ``gen_attn_proj``,
-            ``und_mlp``, ``gen_mlp``, ``proj_in``, ``proj_out``, ``time_embedder``.
-        """
-        if len(gen_seqlens) != len(und_seqlens):
-            raise ValueError(
-                f"Cosmos3 MoT FLOPs need one generation length per reasoner length, got "
-                f"{len(und_seqlens)} and {len(gen_seqlens)}."
-            )
-        num_experts = int(getattr(config, "num_experts", 0) or 0)
-        if num_experts > 0:
-            # The routed-expert branch of ``MotSparseMoeBlock`` needs the per-layer
-            # schedule (``decoder_sparse_step`` / ``mlp_only_layers`` / ``gen_moe_top_k``)
-            # and the shared-expert width. No released Cosmos3 checkpoint is sparse
-            # (Nano's ``num_experts`` is 0), so refuse instead of guessing: a wrong MoE
-            # term would be a silently wrong MFU. ``supports_config`` turns this into a
-            # skipped metric rather than a crash.
-            raise NotImplementedError(
-                f"Cosmos3 MoT FLOPs estimation does not model a sparse-MoE feed-forward yet "
-                f"(config has num_experts={num_experts})."
-            )
-
-        hidden_size = config.hidden_size
-        num_layers = config.num_hidden_layers
-        num_heads = config.num_attention_heads
-        num_kv_heads = config.num_key_value_heads
-        head_dim = int(getattr(config, "head_dim", hidden_size // num_heads))
-        intermediate_size = config.intermediate_size
-        train_joint = bool(getattr(config, "train_joint_reasoner", False))
-        query_size = num_heads * head_dim
-        kv_size = num_kv_heads * head_dim
-        # ``proj_in``/``proj_out`` width: one latent patch of ``latent_channel``
-        # channels on a ``latent_patch_size`` grid (192 for Nano's 48 x 2 x 2).
-        patch_size = int(getattr(config, "latent_patch_size", 1) or 1)
-        patch_latent_dim = int(
-            getattr(config, "patch_latent_dim", getattr(config, "latent_channel", 0) * patch_size**2)
-        )
-        # ``TimestepEmbedder(config.hidden_size)`` is built with the default frequency
-        # width, which the config does not carry.
-        frequency_size = int(getattr(config, "frequency_embedding_size", 256))
-
-        und_tokens = sum(und_seqlens)
-        gen_tokens = sum(gen_seqlens)
-
-        # A frozen reasoner tower (`train_joint_reasoner=False`, the SFT recipe) runs
-        # *forward only*: its K/V are consumed by the generation pass, so every layer
-        # still executes, but no gradient reaches it (its projections produce
-        # ``requires_grad=False`` tensors, so autograd stops there). Counting the
-        # 3x-forward backward for it would over-report the step's work -- and MFU is a
-        # tuning signal, so an over-count silently rewards freezing. Upstream accounts
-        # for exactly this with the ``freeze_und`` flag of its own FLOPs tool
-        # (``cosmos_framework/tools/flops/omni_mot.py:480``); here the switch is the
-        # config field the model itself freezes by.
-        # 6 per (weight element x token) = 3x forward -> 2 (forward only) when frozen.
-        und_training_weight = 6.0 if train_joint else 2.0
-        # 12 per (query x key x head x head_dim) = forward QK^T + attn@V (=4) times 3.
-        und_attention_weight = 12.0 if train_joint else 4.0
-
-        # One QKVO set per tower per layer: q (h -> query_size), k and v
-        # (h -> kv_size), o (query_size -> h).
-        und_projection_params = hidden_size * (query_size + kv_size + kv_size + query_size)
-        gen_projection_params = und_projection_params  # same geometry, separate weights
-        # One SwiGLU feed-forward per tower per layer: gate + up (h -> inter), down
-        # (inter -> h). ``MotMLP``, used by both towers in a dense (non-MoE) block.
-        mlp_params = hidden_size * intermediate_size * 3
-
-        und_attn = (
-            und_attention_weight
-            * num_layers
-            * head_dim
-            * num_heads
-            * sum(length * length for length in und_seqlens)
-        )
-        # The generation pass is not square: Q = gen_len, KV = und_len + gen_len.
-        gen_attn = (
-            12
-            * num_layers
-            * head_dim
-            * num_heads
-            * sum(gen * (und + gen) for und, gen in zip(und_seqlens, gen_seqlens))
-        )
-
-        return {
-            "und_attn": float(und_attn),
-            "gen_attn": float(gen_attn),
-            "und_attn_proj": float(und_training_weight * num_layers * und_projection_params * und_tokens),
-            "gen_attn_proj": float(6 * num_layers * gen_projection_params * gen_tokens),
-            "und_mlp": float(und_training_weight * num_layers * mlp_params * und_tokens),
-            "gen_mlp": float(6 * num_layers * mlp_params * gen_tokens),
-            # Generation-tower adapters and the timestep MLP see generation rows only.
-            "proj_in": float(6 * patch_latent_dim * hidden_size * gen_tokens),
-            "proj_out": float(6 * hidden_size * patch_latent_dim * gen_tokens),
-            "time_embedder": float(6 * (frequency_size * hidden_size + hidden_size * hidden_size) * gen_tokens),
-        }
-
-    def _estimate_cosmos3_mot_flops(
-        self,
-        tokens_sum,
-        batch_seqlens,
-        delta_time,
-        gen_seqlens=None,
-        **kwargs,
-    ):
-        """Estimate Cosmos3 MoT training FLOPs (forward + backward) per step.
-
-        ``tokens_sum`` is ``sum(batch_seqlens)``, i.e. the reasoner-tower token total;
-        the generation tower's total comes from ``gen_seqlens`` and is generally
-        different. See :meth:`_cosmos3_mot_flops_breakdown` for the formula and for
-        where each coefficient comes from.
-
-        ``gen_seqlens=None`` prices the reasoner tower alone, which is what
-        ``supports_config``'s probe call needs; the DiT trainer's meter always passes
-        both halves, so a real step never takes that path (a reasoner-only count would
-        silently under-report by the whole diffusion tower).
-        """
-        del tokens_sum  # the two towers' totals are summed from the two length lists
-        if gen_seqlens is None:
-            gen_seqlens = [0] * len(batch_seqlens)
-        breakdown = self._cosmos3_mot_flops_breakdown(self.config, batch_seqlens, gen_seqlens)
-        flops_all_token = sum(breakdown.values())
         return flops_all_token * (1.0 / delta_time) / 1e12
 
     def _estimate_qwen3_moe_flops(
@@ -1729,7 +1481,6 @@ class VeomniFlopsCounter:
         lora_config: VeOmniLoraConfig | None = None,
         images_seqlens=None,
         freeze_vit: bool | None = None,
-        gen_seqlens=None,
     ):
         """
         Estimate the FLOPS based on the number of valid tokens in the current batch and the time taken.
@@ -1747,11 +1498,6 @@ class VeomniFlopsCounter:
                 models.
             freeze_vit (bool, optional): Whether the vision tower is frozen during full
                 fine-tuning. Ignored when ``lora_config`` is provided.
-            gen_seqlens (List[int], optional): Generation-tower token lengths, parallel to
-                ``batch_seqlens``. Only the Cosmos3 mixture-of-towers DiT consumes it, because
-                its second attention pass is not square: ``gen_seqlens[i]`` queries against
-                ``batch_seqlens[i] + gen_seqlens[i]`` keys/values. Every other model leaves it
-                empty, and then it is not forwarded.
 
         Returns:
             estimated_flops (float): The estimated FLOPS based on the input tokens and time.
@@ -1774,8 +1520,6 @@ class VeomniFlopsCounter:
             kwargs["images_seqlens"] = images_seqlens
         if freeze_vit is not None:
             kwargs["freeze_vit"] = freeze_vit
-        if gen_seqlens is not None:
-            kwargs["gen_seqlens"] = gen_seqlens
 
         tokens_sum = sum(batch_seqlens)
         func = self.estimate_func.get(self.config.model_type, self._estimate_unknown_flops)

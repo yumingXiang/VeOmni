@@ -3,7 +3,7 @@ import PIL
 from ...data_transform import DATA_TRANSFORM_REGISTRY
 from ..image_utils import fetch_images
 from ..preprocess import conv_preprocess
-from ..video_utils import fetch_videos_metadata
+from ..video_utils import fetch_videos, fetch_videos_metadata
 
 
 @DATA_TRANSFORM_REGISTRY.register("dit_online")
@@ -11,46 +11,34 @@ def process_dit_online_example(example, source_name, **kwargs):
     inputs, outputs, images, videos = conv_preprocess(source=source_name, conversations=example, **kwargs)
     if kwargs.get("use_audio_in_video", False):
         raise NotImplementedError("Audio in video is not supported yet for dit training.")
-    # ``fetch_videos_metadata`` rather than ``fetch_videos``: the container's fps is
-    # part of the sample, not a decode detail. Cosmos3's mRoPE scales its temporal
-    # axis by ``base_fps / fps`` (``mrope.py:164-180``), so a transform that drops the
-    # rate trains a 5 fps clip as if it ran at ``base_fps``. The audio half is still
-    # ignored (``use_audio_in_video`` is rejected above).
-    videos, video_metadata, _, _ = fetch_videos_metadata(videos, use_audio_in_video=False, **kwargs)
+    videos, _ = fetch_videos(videos, use_audio_in_video=False, **kwargs)
     images = fetch_images(images, **kwargs)
     processed_example = {
         "inputs": inputs,
         "outputs": outputs,
         "images": images,
         "videos": videos,
-        # One float per sample: the source (pre-sampling) frame rate of its clip.
-        "video_fps": _sample_fps(video_metadata),
     }
     return [processed_example]
 
 
-def _sample_fps(video_metadata) -> float | None:
-    """The fps a single sample's clip was captured at, from its decode metadata.
-
-    Cosmos3 accepts exactly one clip per sample (``get_condition`` rejects more), so
-    a sample's rate is its first clip's. Metadata that is missing or carries no
-    usable rate yields ``None`` rather than an exception: ``video_fps`` is an
-    optional column and the consumers that care (Cosmos3's transformer) fall back to
-    ``base_fps`` and log it. Frames of an already-decoded source synthesised from PIL
-    images legitimately have no container rate at all.
-    """
-    if not video_metadata:
-        return None
-    first = video_metadata[0]
-    if not isinstance(first, dict):
-        return None
-    value = first.get("fps")
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
+@DATA_TRANSFORM_REGISTRY.register("cosmos3_online")
+def process_cosmos3_online_example(example, source_name, **kwargs):
+    """``dit_online`` plus the clip's source fps, which Cosmos3's mRoPE time axis needs."""
+    inputs, outputs, images, videos = conv_preprocess(source=source_name, conversations=example, **kwargs)
+    if kwargs.get("use_audio_in_video", False):
+        raise NotImplementedError("Audio in video is not supported yet for dit training.")
+    videos, video_metadata, _, _ = fetch_videos_metadata(videos, use_audio_in_video=False, **kwargs)
+    images = fetch_images(images, **kwargs)
+    fps = video_metadata[0].get("fps") if video_metadata and isinstance(video_metadata[0], dict) else None
+    processed_example = {
+        "inputs": inputs,
+        "outputs": outputs,
+        "images": images,
+        "videos": videos,
+        "video_fps": float(fps) if fps is not None else None,
+    }
+    return [processed_example]
 
 
 @DATA_TRANSFORM_REGISTRY.register("minimax_h3_online")

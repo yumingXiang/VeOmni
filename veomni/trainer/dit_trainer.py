@@ -12,24 +12,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import inspect
+import json
 import math
 import os
 import pickle as pk
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Sequence, Union
+from typing import Any, Dict, Literal, Optional, Sequence
 
 import torch
 import torch.distributed as dist
 from datasets import Dataset
-from transformers import PretrainedConfig, PreTrainedModel
+from transformers import PreTrainedModel
 from transformers.modeling_outputs import ModelOutput
 
 from veomni.data.multimodal.dit import (
-    data_transform as _data_transform_register,  # noqa: F401  (import side effect: registers dit_offline / dit_online / minimax_h3_online transforms)
+    data_transform as _data_transform_register,  # noqa: F401  (import side effect: registers the dit_offline / dit_online / cosmos3_online / minimax_h3_online transforms)
 )
-from veomni.data.multimodal.dit.packing import build_dit_length_fn
 
 from ..arguments import DataArguments, ModelArguments, TrainingArguments, VeOmniArguments
 from ..data import build_data_transform, build_dataloader
@@ -39,111 +38,68 @@ from ..models import MODEL_CONFIG_REGISTRY, MODELING_REGISTRY, build_config, bui
 from ..models.model_runtime import VeOmniModelRuntime
 from ..ops.config import set_ops_config
 from ..utils import helper
-from ..utils.count_flops import COSMOS3_MOT_MODEL_TYPES, VeomniFlopsCounter
 from ..utils.device import (
     get_device_type,
     synchronize,
 )
-from ..utils.dist_utils import all_reduce
 from .base import BaseTrainer, VeOmniIter
-
-
-if TYPE_CHECKING:  # the cache identity lives with the model; only the type is needed here
-    from ..models.diffusers.cosmos3.cosmos3_condition.latent_cache import LatentRecipe
 
 
 logger = helper.create_logger(__name__)
 
-# Fields a condition config may carry whose value is really read by the *DiT*
-# config. They are not condition-model knobs at all: the loss multiplier lives on
-# the transformer (``modeling_cosmos3_transformer.py:900`` reads
-# ``self.config.loss_scale``), because that is where the prediction exists, but the
-# recipe's own config files have always spelled it under the condition model, so
-# every run config copies it there. A run that set only the condition copy trained
-# with the transformer's default (10.0) while its author believed otherwise: the
-# loss it printed was 10x the flow-matching MSE, and the first 20-step comparison
-# against the open-source baseline was off by exactly that factor.
-_DIT_FIELDS_MIRRORED_FROM_CONDITION_CFG = ("loss_scale",)
+# Dot-prefixed so ``get_data_files`` skips it and ``offline_training`` can read the fill directory directly.
+LATENT_CACHE_MANIFEST = ".latent_cache_manifest.json"
 
 
-def resolve_loss_scale(
-    model_config: Optional[Dict[str, Any]],
-    condition_model_cfg: Optional[Dict[str, Any]],
-) -> Dict[str, Any]:
-    """Mirror ``loss_scale`` from the condition config onto the DiT config.
+class LatentCacheMismatch(RuntimeError):
+    """A latent cache directory was filled under a different encoding recipe."""
 
-    The ``Cosmos3MoTTransformerConfig`` is built from ``model.config_path`` (a
-    shipped JSON that carries no ``loss_scale``) plus ``model.model_config``; the
-    condition config is a *separate* object that the DiT never reads. So a value
-    written under ``model.condition_model_cfg.loss_scale`` would be inert.
 
-    The rule here keeps one knobs' worth of behaviour with two spellings:
+def read_latent_cache_manifest(directory: str) -> Optional[Dict[str, Any]]:
+    path = os.path.join(directory, LATENT_CACHE_MANIFEST)
+    if not os.path.isfile(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
 
-    * only the condition copy set -> it is forwarded to the DiT config;
-    * only ``model.model_config.loss_scale`` set -> used as is;
-    * both set and equal -> used as is (the recipe's files carry both);
-    * both set and different -> refused, because there is no defensible winner.
 
-    Args:
-        model_config: ``model.model_config`` (overrides for the foundation config).
-        condition_model_cfg: ``model.condition_model_cfg`` (kwargs for the frozen
-            condition model).
+def check_latent_cache_manifest(directory: str, recipe: Any) -> Optional[Dict[str, Any]]:
+    """Raise if ``directory`` was filled under a recipe other than ``recipe``; ``None`` when it records none.
 
-    Returns:
-        The ``model_config`` to hand to ``build_config`` / ``build_foundation_model``.
-
-    Raises:
-        ValueError: The two spellings disagree.
+    ``recipe`` is the condition model's ``latent_cache_recipe()``: anything with ``digest()`` and ``as_dict()``.
     """
-    resolved = dict(model_config or {})
-    condition_cfg = condition_model_cfg or {}
-    for name in _DIT_FIELDS_MIRRORED_FROM_CONDITION_CFG:
-        condition_value = condition_cfg.get(name)
-        if condition_value is None:
-            continue
-        if name in resolved and float(resolved[name]) != float(condition_value):
-            raise ValueError(
-                f"`model.model_config.{name}={resolved[name]}` and "
-                f"`model.condition_model_cfg.{name}={condition_value}` disagree, and only the first one is "
-                f"read by the DiT ({name} lives on the transformer config). Set one, or set both to the same "
-                "value."
-            )
-        resolved[name] = condition_value
-    return resolved
+    manifest = read_latent_cache_manifest(directory)
+    if manifest is not None and manifest["recipe"]["digest"] != recipe.digest():
+        current = recipe.as_dict()
+        differing = sorted(key for key, value in manifest["recipe"].items() if current.get(key) != value)
+        raise LatentCacheMismatch(
+            f"The latent cache in {directory!r} was filled under a different encoding recipe (differing: "
+            f"{differing}). Refill it with train.training_task='offline_embedding' into a fresh directory."
+        )
+    return manifest
+
+
+def write_latent_cache_manifest(directory: str, recipe: Any, **extra: Any) -> None:
+    path = os.path.join(directory, LATENT_CACHE_MANIFEST)
+    # Every rank writes while others read: replace atomically.
+    temporary = f"{path}.{os.getpid()}.tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump({"recipe": recipe.as_dict(), **extra}, handle, indent=2, sort_keys=True)
+    os.replace(temporary, path)
 
 
 class OfflineEmbeddingSaver:
-    """Persist per-sample condition rows for ``offline_training``, addressed by content.
+    """Positional parquet export of condition rows for ``offline_training``.
 
-    Two outputs, and the difference between them matters:
-
-    * ``rank_{r}_shard_{i}.parquet`` -- the *positional* export. ``offline_training``
-      replays it through ``dit_offline`` one row at a time, so the row order has to
-      match the dataset order. Kept because the training-side transform reads a
-      directory of parquet shards; it cannot re-derive a per-sample key without
-      decoding the clip again.
-    * ``latent_cache/<key[:2]>/<key>.pt`` -- the *content-addressed* store. The key
-      is a SHA-256 over everything that determines the latent (clip pixels, prompt,
-      geometry fed to the VAE, VAE dtype/weights/statistics, temporal chunking,
-      code version, tokenizer template: see ``latent_cache.py``). A re-run of
-      ``offline_embedding`` looks each sample up here first and skips the VAE on a
-      hit, so the fill is resumable and idempotent. A directory whose
-      ``latent_cache_manifest.json`` records a different recipe is refused outright
-      rather than silently mixed.
-
-    With ``recipe=None`` the saver is the plain positional writer: no manifest, no key
-    store, no dedupe.
+    With a ``recipe`` (the condition model's ``latent_cache_recipe()``), every row is also
+    stored under ``latent_cache/`` by its content key, so a re-run only encodes samples
+    it has not seen, and the directory records the recipe it was filled under.
     """
 
     CACHE_DIRNAME = "latent_cache"
 
     def __init__(
-        self,
-        save_path: str,
-        dataset_length: int = 0,
-        shard_num: int = 1,
-        max_shard=1000,
-        recipe: Optional["LatentRecipe"] = None,
+        self, save_path: str, dataset_length: int = 0, shard_num: int = 1, max_shard=1000, recipe: Any = None
     ):
         from ..distributed.parallel_state import get_parallel_state
 
@@ -167,100 +123,40 @@ class OfflineEmbeddingSaver:
         self.recipe = recipe
         self.cache_hits = 0
         self.cache_misses = 0
-        self._open_cache()
-        # Resume the positional export where the directory left off, so a second
-        # fill cannot overwrite the shards a first one already wrote.
-        self.index = self._next_shard_index()
-
-    # ── content-addressed store ───────────────────────────────────────────────
-
-    @property
-    def cache_dir(self) -> str:
-        return os.path.join(self.save_path, self.CACHE_DIRNAME)
-
-    def _shard_paths(self) -> list[str]:
-        return sorted(name for name in os.listdir(self.save_path) if name.endswith(".parquet"))
-
-    def _next_shard_index(self) -> int:
-        """First unused shard index for this rank.
-
-        The positional export is named ``rank_{dp_rank}_shard_{index}.parquet`` and
-        ``_flush_shard`` increments ``index``, which starts at 0. A fill that is
-        restarted into a non-empty directory (the documented resume path -- the
-        content-addressed store is what makes it cheap) would otherwise rewrite the
-        existing shards from index 0 and silently drop every row the first pass
-        exported, even though the cache itself resumed correctly.
-        """
-        prefix = f"rank_{self.dp_rank}_shard_"
-        used = []
-        for name in self._shard_paths():
-            if not (name.startswith(prefix) and name.endswith(".parquet")):
-                continue
-            frame = name[len(prefix) : -len(".parquet")]
-            if frame.isdigit():
-                used.append(int(frame))
-        return max(used) + 1 if used else 0
+        if recipe is not None:
+            self._open_cache()
 
     def _open_cache(self) -> None:
-        """Validate (or start) the cache directory next to the shards.
-
-        A directory holding shards but no manifest was filled by a version that
-        keyed on position only: its rows cannot be attributed to a recipe, so
-        appending content-keyed rows to it would mix two provenance regimes.
-        Fail instead, and say how to proceed.
-        """
-        if self.recipe is None:
-            return
-        from ..models.diffusers.cosmos3.cosmos3_condition.latent_cache import (
-            LatentCacheMismatch,
-            verify_manifest,
-            write_manifest,
-        )
-
-        shards = self._shard_paths()
-        manifest = verify_manifest(self.save_path, self.recipe)
-        if manifest is None and shards:
+        shards = [name for name in os.listdir(self.save_path) if name.endswith(".parquet")]
+        if check_latent_cache_manifest(self.save_path, self.recipe) is None and shards:
             raise LatentCacheMismatch(
-                f"{self.save_path!r} already holds {len(shards)} positional shard(s) but no "
-                "latent_cache_manifest.json: they were written by a version that identified rows by "
-                "position only, so nothing records which recipe produced them. Point "
-                "data.offline_embedding_save_dir at a fresh directory (or delete the old shards) so the "
-                "cache is filled under a known recipe."
+                f"{self.save_path!r} holds parquet shards but no {LATENT_CACHE_MANIFEST}, so nothing records the "
+                "recipe that produced them; fill a fresh data.offline_embedding_save_dir."
             )
-        os.makedirs(self.cache_dir, exist_ok=True)
-        write_manifest(self.save_path, self.recipe, dp_rank=self.dp_rank, dataset_length=self.dataset_length)
-        logger.info_rank0(
-            f"Latent cache at [{self.cache_dir}] keyed by recipe {self.recipe.digest()[:16]} "
-            f"(schema={self.recipe.schema})."
-        )
+        os.makedirs(os.path.join(self.save_path, self.CACHE_DIRNAME), exist_ok=True)
+        write_latent_cache_manifest(self.save_path, self.recipe, dataset_length=self.dataset_length)
+        # Resume the positional export after the shards this rank already wrote.
+        prefix = f"rank_{self.dp_rank}_shard_"
+        used = [int(name[len(prefix) : -len(".parquet")]) for name in shards if name.startswith(prefix)]
+        self.index = max(used) + 1 if used else 0
 
     def _cache_path(self, cache_key: str) -> str:
-        return os.path.join(self.cache_dir, cache_key[:2], f"{cache_key}.pt")
-
-    def has(self, cache_key: str) -> bool:
-        """Whether this content key is already cached."""
-        return bool(cache_key) and os.path.isfile(self._cache_path(cache_key))
+        return os.path.join(self.save_path, self.CACHE_DIRNAME, cache_key[:2], f"{cache_key}.pt")
 
     def load(self, cache_key: str) -> Optional[Dict[str, Any]]:
         """The cached condition row for ``cache_key``, or ``None``."""
         path = self._cache_path(cache_key)
         if not os.path.isfile(path):
             return None
-        item = torch.load(path, map_location="cpu", weights_only=False)
-        if not isinstance(item, dict):
-            raise RuntimeError(f"latent cache entry {path} is a {type(item).__name__}, expected a dict")
-        return item
+        return torch.load(path, map_location="cpu", weights_only=False)
 
     def _store(self, cache_key: str, save_item: Dict[str, Any]) -> None:
         path = self._cache_path(cache_key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Write-then-rename: an interrupted fill must not leave a half-written
-        # entry that a later run would count as a hit.
+        # Write-then-rename: an interrupted fill must not leave an entry a later run counts as a hit.
         temporary = f"{path}.{os.getpid()}.tmp"
         torch.save(self._cpu_recursive(dict(save_item)), temporary)
         os.replace(temporary, path)
-
-    # ── positional export ─────────────────────────────────────────────────────
 
     @staticmethod
     def _cpu_recursive(obj):
@@ -280,53 +176,32 @@ class OfflineEmbeddingSaver:
             del save_item[key]
         return converted_dict
 
-    def _append_item(self, save_item: Dict[str, torch.Tensor], cache_key: Optional[str] = None):
+    def _append_item(self, save_item: Dict[str, torch.Tensor]):
         if self.rest_len > 0:  # 多余的dummy data buffer 不保存
-            converted = self.to_save_bytes(save_item)
-            if cache_key:
-                # The key travels with the row so a reader (and a human) can tell
-                # which cached latent a positional entry came from.
-                converted["latent_cache_key"] = pk.dumps(str(cache_key))
-            self.buffer.append(converted)
+            self.buffer.append(self.to_save_bytes(save_item))
             self.rest_len -= 1
 
-    def _flush_shard(self) -> None:
-        ds = Dataset.from_list(self.buffer)
-        ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
-        self.buffer = []
-        self.index += 1
-
     def save(self, save_item, cache_key: Optional[str] = None):
-        """Append one sample: store it by content (when keyed) and export it.
-
-        ``cache_key`` is optional so a caller that has no identity (or a fake
-        condition model in a unit test) keeps the pre-existing behaviour.
-        """
-        if cache_key and self.recipe is not None and not self.has(cache_key):
+        if cache_key is not None and not os.path.isfile(self._cache_path(cache_key)):
             self._store(cache_key, save_item)
             self.cache_misses += 1
-        self._append_item(save_item, cache_key=cache_key)
+        self._append_item(save_item)
         if len(self.buffer) >= self.batch_len:
-            self._flush_shard()
+            ds = Dataset.from_list(self.buffer)
+            ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
+            self.buffer = []
+            self.index += 1
 
     def save_last(self):
         if len(self.buffer) > 0:
-            self._flush_shard()
+            ds = Dataset.from_list(self.buffer)
+            ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
+            self.buffer = []
+            self.index += 1
         if self.recipe is not None:
-            from ..models.diffusers.cosmos3.cosmos3_condition.latent_cache import write_manifest
-
-            write_manifest(
-                self.save_path,
-                self.recipe,
-                dp_rank=self.dp_rank,
-                dataset_length=self.dataset_length,
-                saved_samples=self.dataset_length - self.rest_len,
-                cache_hits=self.cache_hits,
-                cache_misses=self.cache_misses,
-            )
-            logger.info_rank0(
-                f"Rank [{self.dp_rank}] latent cache: {self.cache_misses} new sample(s) encoded, "
-                f"{self.cache_hits} reused from {self.cache_dir}."
+            write_latent_cache_manifest(self.save_path, self.recipe, dataset_length=self.dataset_length)
+            logger.info(
+                f"Rank [{self.dp_rank}] latent cache: {self.cache_misses} sample(s) encoded, {self.cache_hits} reused."
             )
 
 
@@ -377,30 +252,20 @@ class DiTDataArguments(DataArguments):
     pack_mode: Literal["token_budget", "mbs"] = field(
         default="mbs",
         metadata={
-            "help": "How many samples share one micro batch (they are still run as one packed sequence). "
-            "'mbs': a fixed `train.micro_batch_size` samples, so `train.global_batch_size` counts samples. "
-            "'token_budget': greedily pack samples until `max_num_tokens_after_packing` tokens, so "
-            "`train.micro_batch_size` counts *micro batches* (keep it 1) and `train.global_batch_size` counts "
-            "micro batches -- this is the open-source PackingDataLoader semantics. "
-            "See veomni/data/multimodal/dit/packing.py."
+            "help": "How samples are grouped into micro batches. 'mbs': a fixed `train.micro_batch_size` samples. "
+            "'token_budget': greedily up to `max_num_tokens_after_packing` tokens per micro batch, priced by the "
+            "condition model's `build_dyn_bsz_length_fn`; `train.micro_batch_size` must then be 1."
         },
     )
     max_num_tokens_after_packing: Optional[int] = field(
         default=None,
-        metadata={
-            "help": "Token budget of one packed micro batch when pack_mode='token_budget'. None falls back to "
-            "`data.max_seq_len`. The open-source vision_sft_nano recipe uses 45056."
-        },
+        metadata={"help": "Token budget of one micro batch for pack_mode='token_budget'; None uses data.max_seq_len."},
     )
     pack_buffer_size: int = field(
         default=1,
         metadata={
-            "help": "How many samples the token-budget batcher must hold before it is even allowed to emit a "
-            "packed micro batch (`data.dyn_bsz_buffer_size` for DiT). The token budget is the real gate; this "
-            "sample floor only widens the greedy scan. 1 (the default) means 'emit as soon as the budget is "
-            "met', which is what the reference PackingDataLoader does. Keep it small for video: the buffer "
-            "holds *decoded clips*, so 200 (the shared text default) would pin ~200 clips in host RAM and "
-            "read 200 clips before step 1."
+            "help": "Samples the token-budget batcher holds before emitting a micro batch (the DiT replacement for "
+            "data.dyn_bsz_buffer_size, whose text default would pin hundreds of decoded clips in host memory)."
         },
     )
     log_sample: bool = field(
@@ -445,30 +310,9 @@ class DiTModelRuntime(VeOmniModelRuntime):
         # populated ops singleton / LOSS_MAPPING. ``build_foundation_model``
         # below will re-apply the same config — that call is idempotent.
         set_ops_config(args.ops_implementation)
-        # The DiT config is the one that owns `loss_scale`; fold the recipe's
-        # condition-model spelling of it in first so both halves of the model are
-        # built from the same value (see `resolve_loss_scale`).
-        model_config = resolve_loss_scale(args.model_config, args.condition_model_cfg)
-        dit_config = build_config(args.config_path, **model_config)
-        # `PretrainedConfig.__init__` stores unknown kwargs as plain attributes, so a
-        # mirrored field the DiT does not declare would be accepted and silently
-        # ignored -- the same failure this mirroring exists to remove. Check the
-        # class signature (not the instance) to catch it.
-        declared = set(inspect.signature(type(dit_config).__init__).parameters)
-        for name in _DIT_FIELDS_MIRRORED_FROM_CONDITION_CFG:
-            if name in model_config and name not in declared:
-                raise ValueError(
-                    f"`model.condition_model_cfg.{name}` was forwarded to the {dit_config.model_type} config, "
-                    f"which does not declare `{name}` (PretrainedConfig would store it silently and nothing "
-                    "would read it). Remove it from `model.condition_model_cfg`."
-                )
+        dit_config = build_config(args.config_path, **args.model_config)
         self.model_config = dit_config
         logger.info_rank0(f"Detected DiT model type: {dit_config.model_type}.")
-        loss_scale = getattr(dit_config, "loss_scale", None)
-        if loss_scale is not None:
-            # One line per run: the printed `dm_loss` is the flow-matching MSE times
-            # this, and a silent 10x is exactly the class of bug this log prevents.
-            logger.info_rank0(f"Flow-matching loss_scale = {float(loss_scale)} (dm_loss = MSE x loss_scale).")
         self._build_condition_model(dit_config.condition_model_type)
         if self.train_args.training_task != "offline_embedding":
             logger.info_rank0(f"Task: {self.train_args.training_task}, prepare dit model.")
@@ -478,7 +322,7 @@ class DiTModelRuntime(VeOmniModelRuntime):
                 torch_dtype="float32" if args.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
                 init_device=args.accelerator.init_device,
                 ops_implementation=args.ops_implementation,
-                config_kwargs=model_config,
+                config_kwargs=args.model_config,
             )
             self.model_config = getattr(self.model, "config", None)
         else:
@@ -571,117 +415,6 @@ class DiTModelRuntime(VeOmniModelRuntime):
             super().save_model_assets()
 
 
-class Cosmos3EnvironMeter(helper.EnvironMeter):
-    """``EnvironMeter`` for a Cosmos3 mixture-of-towers DiT.
-
-    Why a subclass is needed at all: ``DiTTrainer`` is not a ``BaseTrainer`` -- it
-    borrows one (``self.base``) for the callbacks, so ``EnvironMeterCallback`` builds
-    the *generic* meter, which prices a step from ``batch_seqlens`` alone. Cosmos3
-    needs two lengths per sample (the prompt the reasoner tower reads, and the latent
-    patch rows the diffusion tower reads) plus the shape of its two attention passes,
-    neither of which ``batch_seqlens`` can express. Everything else -- the DP
-    all-reduce, the device counters, the checkpoint state -- stays in the base class.
-
-    Installed only for MoT runs (``DiTTrainer._build_flops_meter``): a Wan or
-    MiniMax-H3 run keeps the meter it had, so their metrics are unchanged.
-    """
-
-    def __init__(self, config: "PretrainedConfig", global_batch_size: int, **kwargs) -> None:
-        super().__init__(config, global_batch_size, **kwargs)
-        # Running total of generation-tower tokens, kept beside the base class's
-        # ``consume_tokens`` (reasoner tower) so the reported totals cover both streams.
-        self.consume_gen_tokens = 0
-        # Decided once, at construction: reporting MFU is a diagnostic, so a config the
-        # FLOPs counter cannot price must skip the metric rather than take the run down
-        # (and must not report a plausible-looking 0% either).
-        self.flops_estimable = VeomniFlopsCounter(config).supports_config()
-        if not self.flops_estimable:
-            logger.warning_rank0(
-                "No FLOPs estimator for model_type=%r; MFU is not reported for this run (training is unaffected).",
-                getattr(config, "model_type", None),
-            )
-
-    @staticmethod
-    def seqlens(micro_batch: Dict[str, Any], config: "PretrainedConfig") -> tuple[list[int], list[int]]:
-        """``(reasoner, generation)`` token lengths per sample of one micro batch.
-
-        Expected *after* ``Cosmos3ConditionModel.process_condition``: that is the first
-        point where the exact facts exist -- ``input_ids`` are the tokenized prompts and
-        ``hidden_states`` are the latent grids the patchifier is about to flatten. The
-        raw collated batch carries prompt strings and decoded pixel frames instead, and
-        both lengths would have to be estimated from characters and frame geometry.
-
-        Returns ``([], [])`` for a batch in any other shape, so the pre-condition hook
-        contributes nothing and cannot double count.
-        """
-        hidden_states = micro_batch.get("hidden_states")
-        input_ids = micro_batch.get("input_ids")
-        if hidden_states is None or input_ids is None:
-            return [], []
-
-        # Same arithmetic as ``cosmos3_transformer.patch_row_count``: Cosmos3 never
-        # patches the time axis, so one latent frame contributes (H // p) * (W // p)
-        # patch rows and a clip contributes ``frames`` of those.
-        patch = int(getattr(config, "latent_patch_size", 1) or 1)
-        und_lengths = [int(tokens.numel()) for tokens in input_ids]
-        gen_lengths = []
-        for latent in hidden_states:
-            _, frames, height, width = (int(size) for size in latent.shape)
-            gen_lengths.append(frames * (height // patch) * (width // patch))
-        return und_lengths, gen_lengths
-
-    def add(self, micro_batch: Union[Dict[str, Any], list[Dict[str, Any]]]) -> None:
-        """Append one micro batch's reasoner and generation lengths."""
-        batches = micro_batch if isinstance(micro_batch, list) else [micro_batch]
-        for batch in batches:
-            und_lengths, gen_lengths = self.seqlens(batch, self.config)
-            self.batch_seqlens.extend(und_lengths)
-            self.gen_seqlens.extend(gen_lengths)
-
-    def step(self, delta_time: float, global_step: int, **kwargs) -> Dict[str, Any]:
-        """Add the per-step FLOPs and the two-stream token counters to the base metrics."""
-        # ``super().step`` resets both lists, so take the local sums first.
-        und_local, gen_local = sum(self.batch_seqlens), sum(self.gen_seqlens)
-        metrics = super().step(delta_time, global_step=global_step, **kwargs)
-
-        # ``super().step`` prices ``batch_seqlens``; a step's token throughput has to
-        # cover both streams, and so does the running total a resume restores. The
-        # reduction runs unconditionally so the collective is executed on every rank:
-        # its *result* is what decides, not a rank-local condition.
-        und_tokens, gen_tokens = all_reduce((und_local, gen_local), op="sum", group=self.parallel_state.dp_group)
-        if gen_tokens:
-            total_tokens = und_tokens + gen_tokens
-            self.consume_gen_tokens += gen_tokens
-            metrics.update(
-                {
-                    "tokens_per_second(M)": total_tokens / delta_time / 1e6,
-                    "gen_tokens_per_second(M)": gen_tokens / delta_time / 1e6,
-                    "training/avg_effective_len": (
-                        total_tokens / self.global_batch_size if self.global_batch_size else 0
-                    ),
-                    "consume_tokens(M)": (self.consume_tokens + self.consume_gen_tokens) / 1e6,
-                    "consume_tokens(B)": (self.consume_tokens + self.consume_gen_tokens) / 1e9,
-                }
-            )
-
-        # ``flops_achieved(T)`` is TFLOP/s; the per-step work is that times the step time.
-        metrics["flops_per_step(T)"] = metrics["flops_achieved(T)"] * delta_time
-        if not self.flops_estimable:
-            # Skip the metric, keep the key: a reader (wandb, a doc) sees "unknown"
-            # instead of a hard 0 that looks like a fully stalled device.
-            metrics.update({"flops_achieved(T)": None, "flops_per_step(T)": None, "mfu": None})
-        return metrics
-
-    def state_dict(self) -> Dict[str, Any]:
-        state_dict = super().state_dict()
-        state_dict["consume_gen_tokens"] = self.consume_gen_tokens
-        return state_dict
-
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
-        super().load_state_dict(state_dict)
-        self.consume_gen_tokens = state_dict.get("consume_gen_tokens", 0)
-
-
 class DiTTrainer:
     """
     DiT Trainer merging BaseTrainer infrastructure with DiT-specific model setup.
@@ -692,13 +425,6 @@ class DiTTrainer:
     training_task: Literal["offline_training", "online_training", "offline_embedding"]
     offline_embedding_save_dir: str = None
     offline_embedding_saver: OfflineEmbeddingSaver = None
-    # The per-sample token measure the token-budget batcher used, kept so the
-    # pack-fill diagnostic prices the pack the same way (see `_log_pack_fill`).
-    _pack_length_fn: Optional[Any] = None
-    _pack_fill_logged: bool = False
-    # The MoT-aware meter, or None when this DiT keeps the generic one (see
-    # ``_build_flops_meter``).
-    flops_meter: Optional[Cosmos3EnvironMeter] = None
 
     def __init__(self, args: VeOmniDiTArguments):
         if args.train.channel_loss.enable:
@@ -732,29 +458,6 @@ class DiTTrainer:
             self.base._build_training_context(self.base.model)
 
         self.base._init_callbacks()
-        # ``_init_callbacks`` just built the generic meter; replace it for MoT models so
-        # the FLOPs/MFU metrics describe the two towers. Callbacks resolve the meter on
-        # the trainer at every hook, so this swap is the whole installation.
-        self.flops_meter = self._build_flops_meter()
-
-    def _build_flops_meter(self) -> Optional[Cosmos3EnvironMeter]:
-        """Install :class:`Cosmos3EnvironMeter`, or leave the shared meter in place.
-
-        Only the Cosmos3 MoT layout is priced here; every other DiT (Wan, MiniMax-H3)
-        keeps the meter ``EnvironMeterCallback`` built, byte for byte.
-        """
-        model_config = getattr(self.base.model, "model_config", None)
-        if getattr(model_config, "model_type", None) not in COSMOS3_MOT_MODEL_TYPES:
-            return None
-        meter = Cosmos3EnvironMeter(
-            config=model_config,
-            global_batch_size=self.base.args.train.global_batch_size,
-            empty_cache_steps=self.base.args.train.empty_cache_steps,
-            gc_steps=self.base.args.train.gc_steps,
-            parallel_state=getattr(self.base.model, "parallel_state", None),
-        )
-        self.base.environ_meter = meter
-        return meter
 
     @property
     def condition_model(self) -> PreTrainedModel:
@@ -768,38 +471,18 @@ class DiTTrainer:
         args: VeOmniDiTArguments = self.base.args
         # registers ParallelState("base") before seed
         self.base.device = self.base._setup(args)
-        # `data.pack_mode` decides *how many samples* share a micro batch:
-        #   "mbs"           -> the fixed count the collator chunks to (below);
-        #   "token_budget"  -> the token-budget dataloader (dyn bsz), which is the
-        #                      open-source PackingDataLoader semantics. It also
-        #                      needs a DiT-specific per-sample length function, passed
-        #                      in `_build_dataloader`; the shared fallbacks would price
-        #                      a DiT sample as one token.
-        # The field is a `Literal`, but `Literal` is only enforced by argparse: a YAML
-        # value bypasses the parser and reaches the dataclass unchecked.
         if args.data.pack_mode not in ("token_budget", "mbs"):
             raise ValueError(f"data.pack_mode={args.data.pack_mode!r} is not supported; use 'token_budget' or 'mbs'.")
         args.train.dyn_bsz = args.data.pack_mode == "token_budget"
-        if args.train.dyn_bsz and args.train.micro_batch_size != 1:
+        # dataloader_batch_size was computed in __post_init__ from the config's dyn_bsz; recompute it.
+        if not args.train.dyn_bsz:
+            args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
+        elif args.train.micro_batch_size != 1:
             raise ValueError(
-                "data.pack_mode='token_budget' counts micro batches, not samples: the packed batch is the unit "
-                f"(the open-source recipe runs micro_batch_size=1 with grad_accum), so micro_batch_size must be 1, "
-                f"got {args.train.micro_batch_size}. Use data.pack_mode='mbs' to pack a fixed sample count per "
-                "micro batch."
+                "data.pack_mode='token_budget' packs one micro batch per sample group; set micro_batch_size=1."
             )
-        # dataloader_batch_size was computed in __post_init__ from the config's
-        # dyn_bsz, which pack_mode may just have overridden.
-        if args.train.dyn_bsz:
-            # "main": the dyn-bsz wrapper consumes one raw item per step, so the
-            # DataLoader's own batch is 1. "worker": each item IS an assembled
-            # micro batch, so the DataLoader must gather `num_micro_batch` of them
-            # (that is what `TrainingArguments.__post_init__` computes for text).
-            if args.train.dyn_bsz_runtime == "main":
-                args.train.dataloader_batch_size = 1
-            else:
-                args.train.dataloader_batch_size = (
-                    args.train.global_batch_size // get_parallel_state().dp_size // args.train.micro_batch_size
-                )
+        elif args.train.dyn_bsz_runtime == "main":
+            args.train.dataloader_batch_size = 1
         else:
             args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
         if args.train.training_task == "offline_embedding":
@@ -865,14 +548,12 @@ class DiTTrainer:
                 self.base.train_steps = args.train_steps
             else:
                 self.offline_embedding_saver = None
-
         elif self.training_task == "offline_training":
-            # The replay itself is positional, so the only cheap guard against a
-            # stale cache is the directory-level recipe check: the manifest records
-            # what produced these latents, and a different recipe (other data,
-            # dtype, weights, code, template) means they are not the latents this
-            # run would compute.
-            self._verify_offline_latent_cache()
+            recipe = self._latent_cache_recipe()
+            if recipe is not None and check_latent_cache_manifest(args.data.train_path, recipe) is None:
+                logger.warning_rank0(
+                    f"{args.data.train_path!r} records no latent cache recipe; it cannot be checked against this run."
+                )
 
         # Sync _train_steps across the SP group AFTER padding so every rank
         # agrees on step count (required to avoid deadlocks in broadcast_object_list).
@@ -888,82 +569,24 @@ class DiTTrainer:
             args._train_steps = int(steps_t.item())
             self.base.train_steps = args.train_steps
 
-    def _latent_cache_recipe(self):
-        """The run's latent-encoding recipe, or ``None`` when the model has none.
-
-        Duck-typed on purpose: a DiT condition model that does not implement the
-        content-addressed identity (a Wan/MiniMax-H3 condition model, or a test
-        double) keeps writing a purely positional cache, exactly as before.
-        """
+    def _latent_cache_recipe(self) -> Any:
+        """The condition model's latent encoding recipe, or ``None`` when it has none."""
         builder = getattr(self.condition_model, "latent_cache_recipe", None)
-        return builder() if callable(builder) else None
-
-    def _verify_offline_latent_cache(self):
-        """Refuse an ``offline_training`` cache that a different recipe produced."""
-        recipe = self._latent_cache_recipe()
-        if recipe is None:
-            return
-        from ..models.diffusers.cosmos3.cosmos3_condition.latent_cache import verify_manifest
-
-        cache_dir = self.base.args.data.train_path
-        manifest = verify_manifest(cache_dir, recipe)
-        if manifest is None:
-            logger.warning_rank0(
-                "The latent cache in %r carries no latent_cache_manifest.json, so this run cannot prove "
-                "it was produced by the current encoding recipe (vae_dtype, VAE weights, code version, "
-                "tokenizer template, ...). Training will proceed -- the replay is positional -- but "
-                "re-filling the cache with train.training_task='offline_embedding' would make it "
-                "verifiable.",
-                cache_dir,
-            )
-        else:
-            logger.info_rank0(
-                f"Latent cache {cache_dir!r} verified against recipe {recipe.digest()[:16]} "
-                f"({manifest.get('saved_samples', '?')} sample(s))."
-            )
+        return builder() if builder is not None else None
 
     def _build_dataloader(self):
-        """Build the DiT dataloader.
-        ``pack_mode="mbs"`` keeps a fixed sample count per micro batch
-        (``dyn_bsz=False``). ``pack_mode="token_budget"`` packs greedily up to
-        ``max_num_tokens_after_packing`` tokens, which is VeOmni's dyn-bsz path with a
-        DiT length function: ``micro_batch_size`` is then the number of *packed* micro
-        batches, so the budget handed to ``build_dataloader`` (it uses
-        ``micro_batch_size * max_seq_len``) is the packing target itself.
-        """
+        """Fixed sample count per micro batch, or token-budget packing (``data.pack_mode``)."""
         args = self.base.args
-        token_budget = args.data.max_num_tokens_after_packing or args.data.max_seq_len
-        if args.train.dyn_bsz and args.data.max_num_tokens_after_packing is None:
-            logger.warning_rank0(
-                "data.pack_mode='token_budget' without data.max_num_tokens_after_packing: "
-                f"using data.max_seq_len={args.data.max_seq_len} as the token budget."
-            )
-        length_fn = (
-            build_dit_length_fn(
-                args.data.mm_configs,
-                model_config=getattr(self.base.model, "model_config", None),
-            )
-            if args.train.dyn_bsz
-            else None
-        )
-        # Kept so `_log_pack_fill` prices the packs with the same measure the
-        # batcher used, instead of a second, drifting copy of the arithmetic.
-        self._pack_length_fn = length_fn
+        max_seq_len, length_fn, buffer_size = args.data.max_seq_len, None, args.data.dyn_bsz_buffer_size
         if args.train.dyn_bsz:
-            # The sample floor is not the packing gate -- the token budget is. The
-            # shared default (200) is a *text* heuristic: for DiT it would hold 200
-            # decoded clips (tens of GB of host RAM) and read 200 clips before the
-            # first pack. See `DiTDataArguments.pack_buffer_size`.
-            dyn_bsz_buffer_size = args.data.pack_buffer_size
-            if dyn_bsz_buffer_size < 1:
-                raise ValueError(f"data.pack_buffer_size must be >= 1, got {dyn_bsz_buffer_size}.")
-            logger.info_rank0(
-                f"Token-budget packing: budget={token_budget} tokens/micro batch, "
-                f"buffer floor={dyn_bsz_buffer_size} sample(s) -> "
-                f"{args.train.dataloader_batch_size} packed micro batch(es) per rank per step."
-            )
-        else:
-            dyn_bsz_buffer_size = args.data.dyn_bsz_buffer_size
+            builder = getattr(self.condition_model, "build_dyn_bsz_length_fn", None)
+            if builder is None:
+                raise ValueError(
+                    f"data.pack_mode='token_budget' needs {type(self.condition_model).__name__}.build_dyn_bsz_length_fn."
+                )
+            length_fn = builder(args.data.mm_configs, self.base.model.model_config)
+            max_seq_len = args.data.max_num_tokens_after_packing or args.data.max_seq_len
+            buffer_size = args.data.pack_buffer_size
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
             self.base.train_dataloader = build_dataloader(
                 dataloader_type=args.data.dataloader.type,
@@ -971,7 +594,7 @@ class DiTTrainer:
                 micro_batch_size=args.train.micro_batch_size,
                 global_batch_size=args.train.global_batch_size,
                 dataloader_batch_size=args.train.dataloader_batch_size,
-                max_seq_len=token_budget if args.train.dyn_bsz else args.data.max_seq_len,
+                max_seq_len=max_seq_len,
                 train_steps=args.train_steps,
                 bsz_warmup_ratio=args.train.bsz_warmup_ratio,
                 bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
@@ -980,7 +603,7 @@ class DiTTrainer:
                 dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
                 dyn_bsz_length_fn=length_fn,
                 dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
-                dyn_bsz_buffer_size=dyn_bsz_buffer_size,
+                dyn_bsz_buffer_size=buffer_size,
                 num_workers=args.data.dataloader.num_workers,
                 drop_last=args.data.dataloader.drop_last,
                 pin_memory=args.data.dataloader.pin_memory,
@@ -994,49 +617,6 @@ class DiTTrainer:
             )
         else:
             self.base.train_dataloader = None
-
-    def _log_pack_fill(self, micro_batches: Any) -> None:
-        """Report what each packed micro batch actually holds -- once.
-
-        Why this is not optional: the packing can be wired correctly and still
-        under-fill (a length fn that prices a clip at its pre-resize geometry, a
-        budget that never reaches the dataloader, a sample floor the stream cannot
-        satisfy). From the step time alone that is invisible -- it only shows up as
-        a low MFU, which is exactly how this went unnoticed at
-        ``1.83 s/step`` with one clip per pack. One line, on the first step, makes
-        the pack size a fact in the log.
-        """
-        length_fn = getattr(self, "_pack_length_fn", None)
-        if length_fn is None or getattr(self, "_pack_fill_logged", False):
-            return
-        budget = self.base.args.data.max_num_tokens_after_packing or self.base.args.data.max_seq_len
-        try:
-            samples_per_pack = [len(next(iter(batch.values()))) for batch in micro_batches]
-            tokens_per_pack = [
-                sum(int(length_fn(sample)) for sample in self._unpack_dict_of_list(batch)) for batch in micro_batches
-            ]
-        except Exception as exc:  # a diagnostic must never take the run down
-            logger.warning_rank0(f"Could not price the packed micro batches for logging: {exc}")
-            self._pack_fill_logged = True
-            return
-        self._pack_fill_logged = True
-        fill = [tokens / budget for tokens in tokens_per_pack] if budget else [0.0]
-        logger.info_rank0(
-            "Packed micro batches on this rank's first step: "
-            + ", ".join(
-                f"[{samples} clips, {tokens} tokens, {ratio:.0%} of {budget}]"
-                for samples, tokens, ratio in zip(samples_per_pack, tokens_per_pack, fill)
-            )
-            + "."
-        )
-        if max(samples_per_pack, default=0) <= 1 and len(micro_batches) > 0:
-            logger.warning_rank0(
-                f"Each packed micro batch holds only {max(samples_per_pack, default=0)} sample(s) against a "
-                f"budget of {budget} tokens: packing is not filling the budget, so every block's "
-                "all-gather is being exposed for almost no compute per byte. Check that "
-                "data.pack_mode='token_budget', that data.max_num_tokens_after_packing reaches the "
-                "dataloader, and that the per-sample token measure is not over-pricing a clip."
-            )
 
     def on_train_begin(self):
         self.base.on_train_begin()
@@ -1091,89 +671,47 @@ class DiTTrainer:
         num_items = len(batch[keys[0]])
         return [{k: batch[k][idx] for k in keys} for idx in range(num_items)]
 
-    def _latent_cache_keys(self, micro_batch: Dict[str, Any]):
-        """Content keys for an ``offline_embedding`` micro batch, or ``None``.
-
-        ``None`` means "this condition model has no content-addressed identity"
-        (Wan / MiniMax-H3, or a test double), and the fill then behaves exactly as
-        it did before: positional rows, no manifest, no dedupe.
-        """
-        key_fn = getattr(self.condition_model, "latent_cache_keys", None)
-        if not callable(key_fn):
-            logger.warning_rank0(
-                "This condition model exposes no `latent_cache_keys`; the offline embedding cache is "
-                "addressed by position only, so changing the data, dtype, weights or code between the "
-                "fill and the training run cannot be detected."
-            )
-            return None
-        return key_fn(micro_batch)
-
-    def _save_offline_embeddings(self, micro_batch: Dict[str, Any], cache_keys) -> None:
-        """Encode only the samples the content-addressed cache does not already hold.
-
-        Why the indirection: the export has to stay in dataset order (the training
-        transform replays it positionally), so hits and misses are resolved per
-        sample and then emitted in the original order -- not "hits first, then
-        misses", which would silently permute the cache.
-        """
+    def _save_offline_embeddings(self, micro_batch: Dict[str, Any]) -> None:
         saver = self.offline_embedding_saver
-        if saver is None:  # sp_rank > 0 writes nothing
-            return
-
-        if cache_keys is None:
+        if saver is None or saver.recipe is None:
+            micro_batch = self.preforward(micro_batch)
             with torch.no_grad():
                 condition = self.condition_model.get_condition(**micro_batch)
-            for item in self._unpack_dict_of_list(condition):
-                saver.save(item)
+            if saver is not None:  # sp_rank 0 saves
+                for item in self._unpack_dict_of_list(condition):
+                    saver.save(item)
             return
 
-        rows = []
-        for key in cache_keys:
-            rows.append(saver.load(key) if saver.has(key) else None)
+        # Keys come from the CPU batch (they hash the decoded clips); only cache misses are encoded,
+        # and rows are exported in dataset order because offline_training replays them by position.
+        keys = self.condition_model.latent_cache_keys(micro_batch)
+        rows = [saver.load(key) for key in keys]
         missing = [index for index, row in enumerate(rows) if row is None]
+        saver.cache_hits += len(keys) - len(missing)
         if missing:
             subset = {
-                name: ([value[index] for index in missing] if isinstance(value, list) else value)
+                name: [value[index] for index in missing] if isinstance(value, list) else value
                 for name, value in micro_batch.items()
             }
             with torch.no_grad():
-                condition = self.condition_model.get_condition(**subset)
+                condition = self.condition_model.get_condition(**self.preforward(subset))
             for index, item in zip(missing, self._unpack_dict_of_list(condition)):
                 rows[index] = item
-        for index, key in enumerate(cache_keys):
-            if index not in missing:
-                saver.cache_hits += 1
-            saver.save(rows[index], cache_key=key)
+        for key, row in zip(keys, rows):
+            saver.save(row, cache_key=key)
 
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
-        # The cache key is computed while the batch is still on the CPU: the clip
-        # digest reads the decoded pixels, and `preforward` moves them to the device.
-        cache_keys = None
-        if self.training_task == "offline_embedding" and self.offline_embedding_saver is not None:
-            cache_keys = self._latent_cache_keys(micro_batch)
-
-        micro_batch = self.preforward(micro_batch)
-
         if self.training_task == "offline_embedding":
-            # Encoding is the expensive half of an embedding run, so it is the half
-            # that skips work: a sample whose content key is already cached is
-            # replayed from the cache instead of re-encoded through the VAE.
-            self._save_offline_embeddings(micro_batch, cache_keys)
-            del micro_batch
+            self._save_offline_embeddings(micro_batch)
             return 0.0, {}
 
+        micro_batch = self.preforward(micro_batch)
         if self.training_task == "online_training":
             with torch.no_grad():
                 micro_batch = self.condition_model.get_condition(**micro_batch)
 
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)
-
-        if self.flops_meter is not None:
-            # Price the batch here rather than in ``on_step_begin``: only now do the
-            # exact prompt ids and latent patch grids exist (see
-            # ``Cosmos3EnvironMeter.seqlens``).
-            self.flops_meter.add(micro_batch)
 
         with use_parallel_state(self.base.model.parallel_state), self.base.model_fwd_context:
             outputs = self.base.model(**micro_batch)
@@ -1212,8 +750,6 @@ class DiTTrainer:
 
         self.base._reset_async_activation_offload_if_enabled(self.base.model)
         self.on_step_begin(micro_batches=micro_batches)
-        # One line per run: how much the packing actually put in each micro batch.
-        self._log_pack_fill(micro_batches)
 
         self.base.sync_before_train_step()
 

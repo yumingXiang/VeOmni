@@ -699,7 +699,7 @@ configured and never round-trip through a saved config.
 | fsdp_scope | `Literal["module", "model"]` | `"module"` | SeedOmni: `"module"` wraps each OmniModule independently; `"model"` wraps the composed `OmniModel` once (one FSDP tree). Wrap targets are each child's `_no_split_modules` scoped as `{child}.{ClassName}`; leftover params unshard on `OmniModel.forward()`. Per-module DDP / ExtraParallel / `init_device` / SP-CP-TP-PP overlays are unused under `"model"` (module YAML is not rewritten); the top-level accelerator topology is used. |
 | reshard_after_forward | `bool` | `True` | Reshard after forward (FSDP2). |
 | reshard_after_backward | `bool` | `True` | Reshard after backward (FSDP2). |
-| forward_prefetch | `bool \| None` | `None` | Manual FSDP2 forward prefetch of the per-block all-gather. `true` always installs the prefetch lists (what a pure-FSDP2 model needs), `false` never does, and unset lets the model's layout decide (`extra_parallel` submodules or mixed-precision-ignored classes). |
+| forward_prefetch | `bool` | `True` | Enable forward prefetch. |
 | offload | `bool` | `False` | Enable CPU offload. |
 | offload_pin_memory | `bool` | `True` | Pin the CPU offload buffers, matching torch's `CPUOffloadPolicy` default. Set `False` to keep offloaded shards pageable, so a large-MoE job is not charged non-reclaimable Shmem. |
 | low_precision_reduce_scatter_comm | `bool` | `False` | Use `mixed_precision.param_dtype` (BF16 or FP16) for node-local FSDP2 ReduceScatter communication while keeping FP32 accumulation. See the precision and topology tables below. |
@@ -983,16 +983,14 @@ derived argument groups below.
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
 | offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
-| pack_mode | `Literal["token_budget", "mbs"]` | `"mbs"` | How many samples share one micro batch (they still run as one packed sequence). `"mbs"`: a fixed `train.micro_batch_size` samples, so `train.global_batch_size` counts samples. `"token_budget"`: greedily pack samples until `max_num_tokens_after_packing` tokens, so `train.micro_batch_size` counts *micro batches* (keep it 1) and `train.global_batch_size` counts micro batches — the open-source Cosmos3 `PackingDataLoader` semantics. |
+| pack_mode | `Literal["token_budget", "mbs"]` | `"mbs"` | How samples are grouped into micro batches. `"mbs"`: a fixed `train.micro_batch_size` samples. `"token_budget"`: greedily up to `max_num_tokens_after_packing` tokens per micro batch, priced by the condition model's `build_dyn_bsz_length_fn`; `train.micro_batch_size` must then be 1. |
 | max_num_tokens_after_packing | `Optional[int]` | `None` | Token budget of one packed micro batch when `pack_mode="token_budget"`. `None` falls back to `data.max_seq_len`. |
-| pack_buffer_size | `int` | `1` | How many samples the token-budget batcher must hold before it may emit a packed micro batch (`data.dyn_bsz_buffer_size` for DiT). The token budget is the real gate; this floor only widens the greedy scan. Keep it small for video: the buffer holds decoded clips. |
+| pack_buffer_size | `int` | `1` | Samples the token-budget batcher holds before emitting a micro batch (the DiT replacement for `data.dyn_bsz_buffer_size`, whose text default would pin hundreds of decoded clips). |
 
 `build_native_dataloader(..., dyn_bsz_length_fn=None)` is the extension point behind
-`pack_mode="token_budget"`: a picklable callable returning how many tokens a sample
-costs under the budget. `None` (the default) keeps
-`get_length_fn_by_count_mode(dyn_bsz_count_mode)` for every existing pipeline; a
-modality whose samples do not look like token ids must pass its own — the DiT one is
-`veomni/data/multimodal/dit/packing.py::build_dit_length_fn`.
+`pack_mode="token_budget"`: a picklable per-sample token cost. `None` keeps
+`get_length_fn_by_count_mode(dyn_bsz_count_mode)`; `DiTTrainer` passes the condition model's
+`build_dyn_bsz_length_fn(mm_configs, model_config)`.
 
 ### DiTTrainingArguments
 

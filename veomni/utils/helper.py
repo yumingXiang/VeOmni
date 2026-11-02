@@ -246,11 +246,6 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
-        # Second, per-segment token stream for models whose two halves see different
-        # sequence lengths: Cosmos3's generation tower attends ``gen_len`` queries
-        # against ``und_len + gen_len`` keys, so ``batch_seqlens`` alone cannot describe
-        # the step. Empty for every other model, and then simply not forwarded.
-        self.gen_seqlens = []
 
         if self.enable_multisource:
             if dataloader is None or data_path is None:
@@ -314,8 +309,6 @@ class EnvironMeter:
         flops_kwargs = {}
         if self.images_seqlens:
             flops_kwargs["images_seqlens"] = self.images_seqlens
-        if self.gen_seqlens:
-            flops_kwargs["gen_seqlens"] = self.gen_seqlens
         lora_flops_unavailable = lora_config is not None and not self.supports_lora_flops
         if lora_config is not None:
             if self.supports_lora_flops:
@@ -375,7 +368,6 @@ class EnvironMeter:
         self.batch_seqlens = []
         self.batch_ds_idx = []
         self.images_seqlens = []
-        self.gen_seqlens = []
 
         return metrics
 

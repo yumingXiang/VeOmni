@@ -146,13 +146,8 @@ def build_native_dataloader(
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
-        dyn_bsz_length_fn: Optional per-sample length callable for the token budget,
-            returning how many tokens the sample costs. ``None`` (the default) keeps
-            the shared ``get_length_fn_by_count_mode(dyn_bsz_count_mode)``; a modality
-            whose samples do not look like token ids (a DiT sample is a latent plus a
-            frame tensor and carries no ``attention_mask`` / ``input_ids`` yet) must
-            pass its own, because the shared fallbacks would price each sample as one
-            token and pack the whole stream into a single micro batch.
+        dyn_bsz_length_fn: Optional picklable per-sample token cost for the budget. ``None`` keeps
+            ``get_length_fn_by_count_mode(dyn_bsz_count_mode)``; DiT passes its condition model's.
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
