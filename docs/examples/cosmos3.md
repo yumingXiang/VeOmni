@@ -13,20 +13,19 @@ trains the same objective on the same data.
 
 ## 0. Architecture at a glance
 
-![Cosmos3-Nano module map](../assets/cosmos3-module-map.png)
+Everything lives under `veomni/models/diffusers/cosmos3/`:
 
-*Module map. Each box names the file that owns that piece under
-`veomni/models/diffusers/cosmos3/`. The reasoner tower's QKVO is the checkpoint's
-`to_q`/`to_k`/`to_v`/`to_out`; the generation tower's is `add_q_proj`/`add_k_proj`/
-`add_v_proj`/`to_add_out` plus `proj_in`/`proj_out`, which is why a loaded checkpoint
-needs no key remapping.*
+| sub-package | owns |
+| --- | --- |
+| `cosmos3_core/` | joint two-pass attention, the decoder block, 3-D mRoPE, timestep embedder, packed (TND) layout, rectified-flow sampling and loss |
+| `cosmos3_transformer/` | `Cosmos3MoTTransformer`: the freeze switch, packed / per-sample forward and the loss |
+| `cosmos3_condition/` | `Cosmos3ConditionModel`: frozen Wan2.2 VAE, Qwen3-VL tokenizer, sigma / noise / conditioning draws, latent-cache identity, per-sample token cost |
 
-![Cosmos3-Nano training data flow](../assets/cosmos3-dataflow.png)
-
-*Data flow of one packed micro batch. The online path encodes clips inside the step;
-the offline path replays the content-addressed latent cache. Packing is greedy up to
-45 056 tokens, and the pack is one TND sequence with per-sample `cu_seqlens` - no
-padding and no cross-sample mask.*
+Module names are the released checkpoint's (reasoner `to_q`/`to_k`/`to_v`/`to_out`,
+generator `add_q_proj`/`add_k_proj`/`add_v_proj`/`to_add_out` plus `proj_in`/`proj_out`),
+so a checkpoint loads with no key remapping. A micro batch is greedily packed up to
+45 056 tokens and runs as one TND sequence with per-sample `cu_seqlens`: no padding and
+no cross-sample mask.
 
 ---
 
