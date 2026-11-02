@@ -83,7 +83,7 @@ class PackedLayout:
             if any(length <= 0 for length in lengths):
                 raise ValueError(f"{name}_lengths must all be positive, got {lengths}")
 
-    # 鈹€鈹€ derived quantities 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── derived quantities ───────────────────────────────────────────────────
 
     @property
     def num_samples(self) -> int:

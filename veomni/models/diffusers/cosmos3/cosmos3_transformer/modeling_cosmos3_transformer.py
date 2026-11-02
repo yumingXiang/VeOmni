@@ -175,7 +175,7 @@ class Cosmos3MoTTransformerOutput(ModelOutput):
     predictions: Optional[list[torch.Tensor]] = None
 
 
-# 閳光偓閳光偓 latent <-> patch grid 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+# ── latent <-> patch grid ────────────────────────────────────────────────────
 
 
 def patchify_latent(latent: torch.Tensor, patch_size: tuple[int, int]) -> torch.Tensor:
@@ -252,7 +252,7 @@ def patch_row_count(latent_shape: tuple[int, int, int, int], patch_size: tuple[i
     return frames * (height // ph) * (width // pw)
 
 
-# 閳光偓閳光偓 the shell 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+# ── the shell ────────────────────────────────────────────────────────────────
 
 
 class Cosmos3MoTTransformer(PreTrainedModel):
@@ -380,7 +380,7 @@ class Cosmos3MoTTransformer(PreTrainedModel):
         # instantiated and used without a trainer must behave identically.
         self.freeze_model()
 
-    # 閳光偓閳光偓 weight initialisation 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+    # ── weight initialisation ────────────────────────────────────────────────
 
     @torch.no_grad()
     def _init_modality_heads(self) -> None:
@@ -405,7 +405,7 @@ class Cosmos3MoTTransformer(PreTrainedModel):
         if self.proj_out.bias is not None:
             nn.init.zeros_(self.proj_out.bias)
 
-    # 閳光偓閳光偓 the two-tower freeze switch 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+    # ── the two-tower freeze switch ──────────────────────────────────────────
 
     def freeze_model(self) -> None:
         """Apply ``config.train_joint_reasoner`` to the parameters.
@@ -431,7 +431,7 @@ class Cosmos3MoTTransformer(PreTrainedModel):
                 continue
             parameter.requires_grad_(train_joint or any(key in name for key in TRAINABLE_NAME_KEYS))
 
-    # 閳光偓閳光偓 position ids and rope tables 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+    # ── position ids and rope tables ─────────────────────────────────────────
 
     def gen_temporal_offset(self, und_len: int) -> float:
         """Temporal cursor the generation span of one sample starts from.
@@ -533,7 +533,7 @@ class Cosmos3MoTTransformer(PreTrainedModel):
             )
         return und_rope, gen_rope
 
-    # 閳光偓閳光偓 one sample 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+    # ── one sample ───────────────────────────────────────────────────────────
 
     def _validate_latent(self, latent: object, index: int | None = None) -> None:
         """Reject a ``hidden_states`` entry that is not a 4-D latent tensor."""
@@ -644,7 +644,7 @@ class Cosmos3MoTTransformer(PreTrainedModel):
 
         return unpatchify_latent(self.proj_out(hidden_gen), latent.shape, self.patch_size)
 
-    # 閳光偓閳光偓 one packed micro-batch 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+    # ── one packed micro-batch ───────────────────────────────────────────────
 
     def _packed_rope_tables(
         self,
@@ -822,7 +822,7 @@ class Cosmos3MoTTransformer(PreTrainedModel):
             raise RuntimeError(f"packed forward produced {len(predictions)} predictions for {sample_count} samples.")
         return predictions
 
-    # 閳光偓閳光偓 the trainer's forward 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+    # ── the trainer's forward ────────────────────────────────────────────────
 
     def _packs_micro_batch(self, sample_count: int, *, packed: Optional[bool] = None) -> bool:
         """Whether this call runs the micro-batch as one packed (TND) sequence.
@@ -1037,7 +1037,7 @@ class Cosmos3MoTTransformer(PreTrainedModel):
         loss = None if not losses else {"dm_loss": torch.stack(losses).mean()}
         return Cosmos3MoTTransformerOutput(loss=loss, predictions=predictions)
 
-    # 閳光偓閳光偓 framework hooks 閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓閳光偓
+    # ── framework hooks ─────────────────────────────────────────────────────
 
     def get_parallel_plan(self) -> ParallelPlan:
         """No ExtraParallel dimension: every parameter is plain FSDP2-sharded.

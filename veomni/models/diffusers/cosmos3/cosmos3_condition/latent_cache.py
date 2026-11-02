@@ -76,7 +76,7 @@ class LatentCacheMismatch(RuntimeError):
     """The on-disk latent cache was produced by a different recipe."""
 
 
-# 鈹€鈹€ hashing primitives 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── hashing primitives ──────────────────────────────────────────────────────
 
 
 def _tagged(tag: str, payload: bytes) -> bytes:
@@ -245,7 +245,7 @@ def latent_stats_digest(vae: Any) -> str:
     )
 
 
-# 鈹€鈹€ the run-level half of the key 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── the run-level half of the key ───────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -344,7 +344,7 @@ def latent_cache_key(
     )
 
 
-# 鈹€鈹€ the on-disk manifest 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+# ── the on-disk manifest ────────────────────────────────────────────────────
 
 MANIFEST_FILENAME = "latent_cache_manifest.json"
 

@@ -1,4 +1,4 @@
-"""Wan2.2 VAE access for the Cosmos3 condition side 鈥?a thin wrapper, not a port.
+"""Wan2.2 VAE access for the Cosmos3 condition side — a thin wrapper, not a port.
 
 Cosmos3-Nano ships its video tokenizer as a standard ``diffusers`` Wan2.2 VAE
 (``vae/diffusion_pytorch_model.safetensors`` + ``vae/config.json``), so the
@@ -41,7 +41,7 @@ logger = logging.get_logger(__name__)
 
 
 # Wan2.2's published latent statistics (48 channels). Only used when the VAE
-# config does not carry ``latents_mean`` / ``latents_std`` 鈥?e.g. a converted
+# config does not carry ``latents_mean`` / ``latents_std`` — e.g. a converted
 # checkpoint that dropped the VAE config, or a bare safetensors directory.
 # Source: ``cosmos_framework/model/generator/tokenizers/wan2pt2_vae_4x16x16.py``
 # ("Wan 2.2 mean and std values (48 dimensions)"), i.e. the values the reference
@@ -173,7 +173,7 @@ def _reject_channels_last_3d(module: torch.nn.Module, *, name: str) -> None:
         if tensor.is_contiguous(memory_format=torch.channels_last_3d) and not tensor.is_contiguous():
             raise RuntimeError(
                 f"{name}.{tensor_name} is stored in channels_last_3d layout. Unsupported 3D conv memory "
-                "format on this accelerator 鈥?reload the component with contiguous weights."
+                "format on this accelerator — reload the component with contiguous weights."
             )
 
 
@@ -195,7 +195,7 @@ class Wan22VAE(torch.nn.Module):
       * :meth:`encode` takes ``[B, 3, T, H, W]`` in ``[-1, 1]`` and returns the
         *unnormalized* latent mean ``[B, 48, 1 + (T - 1) // 4, H // 16, W // 16]``
         (deterministic ``mode()`` of the posterior, which is what the reference
-        model trains against 鈥?sampling would inject noise the target does not
+        model trains against — sampling would inject noise the target does not
         account for).
       * :meth:`normalize_latents` / :meth:`denormalize_latents` apply
         ``(z - mean) / std`` per channel; :meth:`encode_latents` is the
@@ -228,7 +228,7 @@ class Wan22VAE(torch.nn.Module):
         self._latents_std_source = latents_std
         _reject_channels_last_3d(vae, name=component_name)
 
-    # 鈹€鈹€ construction 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── construction ─────────────────────────────────────────────────────────
 
     @classmethod
     def from_pretrained(
@@ -267,7 +267,7 @@ class Wan22VAE(torch.nn.Module):
             **kwargs,
         )
 
-    # 鈹€鈹€ config / device view 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── config / device view ─────────────────────────────────────────────────
 
     @property
     def config(self) -> Any:
@@ -297,7 +297,7 @@ class Wan22VAE(torch.nn.Module):
     def device(self) -> torch.device:
         return next(self.vae.parameters()).device
 
-    # 鈹€鈹€ latent statistics 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── latent statistics ────────────────────────────────────────────────────
 
     def _latent_stats(self, *, device: torch.device, dtype: torch.dtype):
         """Per-channel ``(mean, std)`` from the VAE config, else Wan2.2's published values."""
@@ -322,7 +322,7 @@ class Wan22VAE(torch.nn.Module):
         )
 
     def normalize_latents(self, latents: torch.Tensor) -> torch.Tensor:
-        """``(z - latents_mean) / latents_std`` 鈥?the scale the DiT was trained on."""
+        """``(z - latents_mean) / latents_std`` — the scale the DiT was trained on."""
         mean, std = self._latent_stats(device=latents.device, dtype=latents.dtype)
         return (latents - mean) / std
 
@@ -349,7 +349,7 @@ class Wan22VAE(torch.nn.Module):
         mean, std = self._latent_stats(device=latents.device, dtype=latents.dtype)
         return latents * std + mean
 
-    # 鈹€鈹€ geometry helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── geometry helpers ─────────────────────────────────────────────────────
 
     def latent_num_frames(self, num_pixel_frames: int) -> int:
         """Latent frame count for ``num_pixel_frames``: causal, one latent per 4 frames."""
@@ -358,10 +358,10 @@ class Wan22VAE(torch.nn.Module):
         return 1 + (int(num_pixel_frames) - 1) // self.temporal_scale
 
 
-    # 鈹€鈹€ encode / decode 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── encode / decode ──────────────────────────────────────────────────────
 
     def encode(self, video: torch.Tensor) -> torch.Tensor:
-        """``[B, 3, T, H, W]`` in ``[-1, 1]`` 鈫?unnormalized latents ``[B, C, T_lat, H // 16, W // 16]``."""
+        """``[B, 3, T, H, W]`` in ``[-1, 1]`` → unnormalized latents ``[B, C, T_lat, H // 16, W // 16]``."""
         if video.dim() != 5 or video.shape[1] != 3:
             raise ValueError(f"Wan2.2 VAE expects video shaped [B, 3, T, H, W]; got {tuple(video.shape)}.")
         if self.temporal_chunk_frames and video.shape[2] > self.temporal_chunk_frames:
@@ -399,7 +399,7 @@ class Wan22VAE(torch.nn.Module):
         so the causal feature cache is warm; the warmed-up latents are dropped.
         The Wan VAE's temporal receptive field is a handful of frames, so with
         ``temporal_chunk_warmup`` >= that window the stitched result matches a
-        full-clip encode 鈥?the assembled length is asserted against
+        full-clip encode — the assembled length is asserted against
         :meth:`latent_num_frames` so a mismatch cannot pass silently.
         """
         chunk = self.temporal_chunk_frames
@@ -417,15 +417,15 @@ class Wan22VAE(torch.nn.Module):
         return torch.cat(pieces, dim=2)
 
     def encode_latents(self, video: torch.Tensor) -> torch.Tensor:
-        """Encode and normalize 鈥?the exact tensor the diffusion transformer consumes."""
+        """Encode and normalize — the exact tensor the diffusion transformer consumes."""
         return self.normalize_latents(self.encode(video))
 
     def decode(self, latents: torch.Tensor) -> torch.Tensor:
-        """Normalized latents 鈫?``[B, 3, T, H, W]`` in ``[-1, 1]``."""
+        """Normalized latents → ``[B, 3, T, H, W]`` in ``[-1, 1]``."""
         if latents.dim() != 5:
             raise ValueError(f"Wan2.2 VAE expects latents shaped [B, C, T, H, W]; got {tuple(latents.shape)}.")
         output = self.vae.decode(self.denormalize_latents(latents))
         return output.sample if hasattr(output, "sample") else output
 
-    # 鈹€鈹€ memory knobs 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── memory knobs ─────────────────────────────────────────────────────────
 

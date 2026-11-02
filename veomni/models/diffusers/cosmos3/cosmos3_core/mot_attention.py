@@ -10,7 +10,7 @@ Two batching shapes reach those calls. **Dense** (``micro_batch_size=1``) needs 
 ``cu_seqlens`` nor a mask, so each pass is one kernel call over the whole tensor.
 **Packed / TND** puts several samples in one sequence, so each pass is a varlen call
 with ``cu_seq_lens_q``/``cu_seq_lens_k`` and the layout in :mod:`.packed_layout`; the
-two passes then have different segment pairs (``und``鈫抈`und``, ``gen``鈫抈`und+gen``),
+two passes then have different segment pairs (``und``→``und``, ``gen``→``und+gen``),
 which a varlen kernel accepts as two independent cumulative-length vectors. Because a
 sample's K/V block is contiguous (see :func:`.packed_layout.interleave_und_gen`),
 cross-sample leakage is impossible by construction rather than by masking.

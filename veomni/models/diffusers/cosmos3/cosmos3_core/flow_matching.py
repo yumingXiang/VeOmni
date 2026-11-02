@@ -211,7 +211,7 @@ def flow_matching_loss(
     function implements.
 
     ``time_weight`` implements ``train_time_weight="uniform"`` as its default
-    ``None`` (weight 鈮?1). A fully conditioned sample reduces to a
+    ``None`` (weight ≠ 1). A fully conditioned sample reduces to a
     gradient-carrying zero instead of ``0/0``: the numerator is exactly zero, so
     the ``.mean()`` is zero.
 

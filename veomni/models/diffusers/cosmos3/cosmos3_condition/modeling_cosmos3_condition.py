@@ -84,13 +84,13 @@ class Cosmos3ConditionModel(PreTrainedModel):
         self.seed = config.seed
         # A CPU generator, deliberately: ``TrainTimeSampler`` draws with
         # ``torch.rand`` on CPU, and a device-independent stream keeps a saved
-        # RNG state restorable on a different accelerator (resume on GPU鈫擭PU).
+        # RNG state restorable on a different accelerator (resume on GPU→NPU).
         self.generator = torch.Generator(device="cpu")
         self.generator.manual_seed(int(self.seed if self.seed is not None else 42) + get_parallel_state().dp_rank)
 
         self._load_components()
 
-    # 鈹€鈹€ construction 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── construction ─────────────────────────────────────────────────────────
 
     def _load_components(self) -> None:
         config = self.config
@@ -115,7 +115,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
         config = self.config
         if self.meta_init:
             # ``offline_training`` replays precomputed latents and never runs the
-            # encoder, so only the config is needed 鈥?loading 250M frozen VAE
+            # encoder, so only the config is needed — loading 250M frozen VAE
             # parameters per rank would be pure waste.
             from diffusers import AutoencoderKLWan
 
@@ -171,7 +171,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
         if self.processor is not None and getattr(self.processor, "tokenizer", None) is not None:
             self.tokenizer = self.processor.tokenizer
 
-    # 鈹€鈹€ RNG state (resume contract) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── RNG state (resume contract) ──────────────────────────────────────────
 
     def rng_state_dict(self) -> dict[str, torch.Tensor]:
         """Snapshot the noise/sigma stream for the job-level checkpoint.
@@ -187,7 +187,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
         """Restore a snapshot produced by :meth:`rng_state_dict`."""
         self.generator.set_state(state["generator"])
 
-    # 鈹€鈹€ latent cache identity (offline_embedding / offline_training) 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── latent cache identity (offline_embedding / offline_training) ─────────
 
     def vae_component_dir(self) -> str:
         """Directory holding the VAE checkpoint files, whether or not they loaded.
@@ -291,7 +291,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
             keys.append(self.latent_cache_key(prompt, frames))
         return keys
 
-    # 鈹€鈹€ get_condition: raw data 鈫?per-sample condition 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── get_condition: raw data → per-sample condition ───────────────────────
 
     @torch.no_grad()
     def get_condition(
@@ -306,7 +306,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
         """Encode prompts and videos into the per-sample condition lists.
 
         Args:
-            inputs: ``list[str]`` 鈥?one prompt (the structured-JSON caption) per
+            inputs: ``list[str]`` — one prompt (the structured-JSON caption) per
                 sample.
             videos: one entry per sample. Either a decoded frame tensor
                 ``[T, C, H, W]`` (what the ``dit_online`` transform produces via
@@ -331,7 +331,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
             ``dict[str, list]`` with one entry per sample:
 
             * ``latents``: normalized VAE latent ``[C, T_lat, H_lat, W_lat]``
-              (no batch dimension 鈥?the transformer consumes one clip's latent
+              (no batch dimension — the transformer consumes one clip's latent
               grid per list element).
             * ``resolution``: the shift bucket (``str``) the sample was encoded
               for.
@@ -522,11 +522,11 @@ class Cosmos3ConditionModel(PreTrainedModel):
         return decoded[0]
 
     def _prepare_video(self, frames: torch.Tensor) -> torch.Tensor:
-        """``[T, C, H, W]`` (uint8 or float) 鈫?``[1, 3, T, H, W]`` float in ``[-1, 1]``.
+        """``[T, C, H, W]`` (uint8 or float) → ``[1, 3, T, H, W]`` float in ``[-1, 1]``.
 
         The VAE contract is ``[-1, 1]`` (``VideoProcessor.preprocess_video``'s
         ``min_value=-1``), so the range is normalized here instead of being
-        assumed 鈥?a mistyped ``[0, 255]`` tensor produces a plausible-looking but
+        assumed — a mistyped ``[0, 255]`` tensor produces a plausible-looking but
         useless latent rather than an error.
         """
         source_dtype = frames.dtype
@@ -690,7 +690,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
         self._generation_marker_ids = markers
         return markers.to(device="cpu")
 
-    # 鈹€鈹€ process_condition: sigma + noise 鈫?model inputs and targets 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── process_condition: sigma + noise → model inputs and targets ──────────
 
     @torch.no_grad()
     def process_condition(
@@ -874,7 +874,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
         Delegates to ``cosmos3_core.flow_matching.interpolate``, which owns the
         reference formulas (``x_t = noise * sigma + clean * (1 - sigma)``,
         ``target = noise - clean``). The shape check catches a sigma whose shape
-        silently broadcast along the wrong axis 鈥?that would train on a target
+        silently broadcast along the wrong axis — that would train on a target
         that no longer matches the prediction grid.
 
         ``condition_mask`` (``[T_lat, 1, 1]`` or ``None``) lowers sigma to exactly
@@ -903,7 +903,7 @@ class Cosmos3ConditionModel(PreTrainedModel):
             )
         return hidden_states, training_target
 
-    # 鈹€鈹€ helpers 鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€鈹€
+    # ── helpers ──────────────────────────────────────────────────────────────
 
     def _resolve_resolutions(self, resolution: Any, count: int) -> list[str]:
         """Broadcast the batch-level resolution bucket to one bucket per sample."""

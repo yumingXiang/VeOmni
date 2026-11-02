@@ -6,17 +6,17 @@ clip and *one or more* ``t2w_windows`` per row (see
 consumes ``(prompt, outputs, images, videos)`` per sample, so this module does
 the three translations the generic transform cannot:
 
-1. **window 闁?sample**: a row collapses to a single window. The open-source
+1. **window → sample**: a row collapses to a single window. The open-source
    ``SFTDataset`` also crops the clip to that window's ``start_frame`` /
    ``end_frame``; here the video reference stays the whole file, which is exact
    for this dataset (one window covering the clip) and is the reason the default
    ``window_selection`` is ``"first"`` rather than a per-epoch random draw.
-2. **caption 闁?prompt**: ``caption_json`` (the canonical structured caption) is
+2. **caption → prompt**: ``caption_json`` (the canonical structured caption) is
    serialized verbatim, because the model is trained *and* run against the exact
    same JSON string. The dense ``caption`` string is the fallback and gets the
    reference's media suffixes appended, so a row that predates ``caption_json``
    still describes its own duration/fps/resolution.
-3. **media 闁?reference**: the clip becomes a path handed to the shared video
+3. **media → reference**: the clip becomes a path handed to the shared video
    loader. Nothing is decoded here: decoding belongs to the dataloader workers
    (``fetch_videos``) and re-encoding frames to JPEG inside a dataset worker, as
    the first cut of this adapter did, burns worker CPU on a lossy round-trip the
@@ -33,7 +33,7 @@ latent, so ``t_latent`` is ``latent.shape[1]`` -- deriving it from the tensor is
 exact and cannot disagree with the VAE. Sampling there also keeps the mixture on
 the resumable ``rng_state_dict`` stream instead of a dataloader worker's global
 RNG, which no checkpoint of ours restores. So this preprocessor stays a pure
-row 闁?``(prompt, _, [], [video_path])`` mapping; adding a ``conditioning`` field
+row → ``(prompt, _, [], [video_path])`` mapping; adding a ``conditioning`` field
 here would duplicate the draw and desynchronize it from the noise stream.
 
 **CFG dropout *is* here, though**, and that asymmetry is the reference's: clearing a
@@ -254,12 +254,12 @@ def cosmos3_sft_jsonl_preprocess(
     cfg_dropout_seed: int = _DEFAULT_CFG_DROPOUT_SEED,
     **kwargs,
 ):
-    """One JSONL row 闁?``(prompt, outputs, images, videos)`` for ``dit_online``.
+    """One JSONL row → ``(prompt, outputs, images, videos)`` for ``dit_online``.
 
     Args:
         conversations: the raw dataset row (``uuid`` / ``duration`` / ``width`` /
             ``height`` / ``vision_path`` / ``t2w_windows``).
-        data_dir: dataset root the relative ``vision_path`` resolves against 闁?            set it as ``data.mm_configs.data_dir`` (the directory that holds
+        data_dir: dataset root the relative ``vision_path`` resolves against →             set it as ``data.mm_configs.data_dir`` (the directory that holds
             ``videos/`` next to ``video_dataset_file.jsonl``).
         window_selection: ``"first"`` (default), ``"random"`` (matches the
             open-source recipe's per-epoch window draw) or ``"index"``.
@@ -285,7 +285,7 @@ def cosmos3_sft_jsonl_preprocess(
         **kwargs: forwarded by the transform; unknown keys are ignored.
 
     Returns:
-        ``(prompt, {}, [], [video_path])`` 闁?VeOmni's DiT shape, with the video
+        ``(prompt, {}, [], [video_path])`` → VeOmni's DiT shape, with the video
         left as a reference for the loader.
     """
     window = _select_window(conversations, window_selection, window_index)
