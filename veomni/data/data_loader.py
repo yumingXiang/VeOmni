@@ -79,6 +79,7 @@ def build_native_dataloader(
     dyn_bsz: bool = True,
     dyn_bsz_runtime: Literal["main", "worker"] = "main",
     dyn_bsz_count_mode: Literal["total", "effective"] = "total",
+    dyn_bsz_length_fn: Optional[Callable[[Any], int]] = None,
     dyn_bsz_physical_overflow_ratio: float = 1.5,
     dyn_bsz_dataset_save_by_idx: bool = False,  # Whether to save dynamic-batching buffers by index for worker-side checkpoint/resume.
     dyn_bsz_buffer_size: int = 200,
@@ -145,6 +146,13 @@ def build_native_dataloader(
             Use ``"spawn"`` when worker-side code must be pickle-safe and should not
             inherit parent-process state; keep ``"fork"`` for the legacy Linux behavior.
             Example: ``multiprocessing_context="spawn"``.
+        dyn_bsz_length_fn: Optional per-sample length callable for the token budget,
+            returning how many tokens the sample costs. ``None`` (the default) keeps
+            the shared ``get_length_fn_by_count_mode(dyn_bsz_count_mode)``; a modality
+            whose samples do not look like token ids (a DiT sample is a latent plus a
+            frame tensor and carries no ``attention_mask`` / ``input_ids`` yet) must
+            pass its own, because the shared fallbacks would price each sample as one
+            token and pack the whole stream into a single micro batch.
     """
     if collate_fn_kwargs is None:
         collate_fn_kwargs = {}
@@ -175,7 +183,7 @@ def build_native_dataloader(
             f"bsz_warmup_init_mbtoken: {bsz_warmup_init_mbtoken}."
         )
         dyn_bsz_collate_fn = collate_fn
-        dyn_bsz_length_fn = get_length_fn_by_count_mode(dyn_bsz_count_mode)
+        dyn_bsz_length_fn = dyn_bsz_length_fn or get_length_fn_by_count_mode(dyn_bsz_count_mode)
         if dyn_bsz_count_mode == "effective":
             if dyn_bsz_physical_overflow_ratio < 1.0:
                 raise ValueError(

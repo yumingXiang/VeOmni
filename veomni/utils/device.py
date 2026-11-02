@@ -179,10 +179,21 @@ def is_cncl_backend() -> bool:
 
 
 def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -> int:
-    """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU."""
+    """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU.
+
+    torch.cuda is not necessarily an NVIDIA GPU: on an Ascend host torch_npu
+    aliases the cuda namespace onto NPU, so IS_CUDA_AVAILABLE is true while
+    get_device_capability() has nothing to report and returns None. Describing
+    the host as capability 0 (the documented "no GPU" answer) keeps the ops registry's
+    requirement probing -- GpuKernelRequirement.matches reaches this on every
+    default_impl lookup -- from raising TypeError on NPU.
+    """
     if not IS_CUDA_AVAILABLE:
         return 0
-    major, minor = torch.cuda.get_device_capability(device)
+    capability = torch.cuda.get_device_capability(device)
+    if capability is None:
+        return 0
+    major, minor = capability
     return major * 10 + minor
 
 

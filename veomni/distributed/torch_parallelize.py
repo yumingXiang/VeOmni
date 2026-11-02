@@ -422,6 +422,51 @@ def _configure_fsdp_gradient_reduction(
         module.set_gradient_divide_factor(gradient_divide_factor)
 
 
+def resolve_manual_prefetch(
+    enable_forward_prefetch: Optional[bool],
+    *,
+    any_extra_parallel_enabled: bool,
+    mp_ignored_classes: bool,
+) -> bool:
+    """Decide whether FSDP2 needs the *manual* per-block prefetch lists.
+
+    Why this is a separate function: the decision used to be an inline
+    ``(any_extra_parallel_enabled or mp_ignored_classes) and kwargs.pop(...)``,
+    which silently discarded an explicit ``fsdp_config.forward_prefetch: true``
+    for a plain-FSDP2 model (Cosmos3: no ``tp``, no ``ulysses``, empty
+    ``extra_parallel_plan`` -- so the left operand was ``False`` and the whole
+    expression collapsed to ``False`` before the request was even read). Keeping
+    the rule in one named place makes it unit-testable without a device mesh.
+
+    Semantics (three-state, hence ``Optional[bool]``):
+
+    * ``True``  -- a forward-prefetch request. It is honoured whatever the
+      model's parallel layout is: the prefetch lists are what overlaps the
+      per-block all-gather with the previous block's compute, and for a
+      pure-FSDP2 model FSDP2's own implicit ordering only covers blocks it
+      wrapped itself (it cannot know about modules sharded separately).
+    * ``False`` -- an explicit opt-out. Manual prefetch is off; this is what a
+      config that hits the known NPU stall/slow-step behaviour sets.
+    * ``None``  -- not configured. The layout decides, i.e. exactly the
+      pre-existing behaviour: prefetch only when ``extra_parallel`` submodules
+      or mixed-precision-ignored classes were wrapped separately, because those
+      are the modules FSDP2's own ordering does not sequence.
+
+    Args:
+        enable_forward_prefetch: The request, or ``None`` when unset.
+        any_extra_parallel_enabled: ``ParallelState.any_extra_parallel_enabled``
+            (e.g. ``ep``), so the wrap created extra FSDP modules per layer.
+        mp_ignored_classes: Whether the model declared classes that are sharded
+            with mixed precision ignored.
+
+    Returns:
+        Whether to install the manual forward/backward prefetch lists.
+    """
+    if enable_forward_prefetch is not None:
+        return bool(enable_forward_prefetch)
+    return bool(any_extra_parallel_enabled or mp_ignored_classes)
+
+
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str | Mapping[str, str]] = None,
@@ -859,9 +904,18 @@ def parallelize_model_fsdp2(
         )
 
     # configure manual prefetching when needed
-    need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
-    ) and kwargs.pop("enable_forward_prefetch", True)
+    requested_prefetch: Optional[bool] = kwargs.pop("enable_forward_prefetch", None)
+    need_manual_prefetch = resolve_manual_prefetch(
+        requested_prefetch,
+        any_extra_parallel_enabled=parallel_state.any_extra_parallel_enabled,
+        mp_ignored_classes=mp_ignored_classes is not None,
+    )
+    logger.info_rank0(
+        f"FSDP2 manual prefetch: {need_manual_prefetch} "
+        f"(requested={requested_prefetch!r}, "
+        f"any_extra_parallel_enabled={parallel_state.any_extra_parallel_enabled}, "
+        f"mp_ignored_classes={mp_ignored_classes is not None})."
+    )
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules
         next_blocks = blocks[1:] + [None]

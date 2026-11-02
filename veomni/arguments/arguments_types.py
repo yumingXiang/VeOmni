@@ -648,10 +648,19 @@ class FSDPConfig:
         default=True,
         metadata={"help": "Enable reshard after backward for FSDP2."},
     )
-    forward_prefetch: bool = field(
-        default=True,
-        metadata={"help": "Enable forward prefetch."},
+    forward_prefetch: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Manual FSDP2 forward prefetch for the per-block all-gather. Three states: true = always "
+                "install the prefetch lists (needed by a pure-FSDP2 model, where FSDP2's implicit ordering "
+                "only covers the blocks it wrapped itself); false = never; unset = only when the model's "
+                "layout forces manual ordering (extra-parallel submodules or mixed-precision-ignored "
+                "classes). See distributed/torch_parallelize.py::resolve_manual_prefetch."
+            )
+        },
     )
+
     offload: bool = field(
         default=False,
         metadata={"help": "Enable CPU offload for FSDP2."},

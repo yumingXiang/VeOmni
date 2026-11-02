@@ -78,6 +78,7 @@ def calculate_frame_indices(
     frame_factor_remainder: int = 0,
     min_frames: int = None,
     max_frames: int = None,
+    frame_selection: str = "linspace",
     **kwargs,
 ) -> tuple[List[int], int]:
     """Calculate frame indices to sample and padding count.
@@ -94,6 +95,11 @@ def calculate_frame_indices(
             temporal VAE compresses T frames to (T-1)/factor + 1 latents.
         min_frames: Minimum frames to output
         max_frames: Maximum frames to output
+        frame_selection: how the ``sample_count`` frames are chosen out of
+            ``total_frames``. ``"linspace"`` (default) spreads them evenly over the
+            whole clip; ``"prefix"`` takes a contiguous prefix at a fixed stride,
+            which is what the Cosmos video readers do, so a short clip loses its tail
+            instead of having its interior frames shifted.
         **kwargs: Extra arguments (ignored)
 
     Returns:
@@ -138,7 +144,22 @@ def calculate_frame_indices(
 
     # Uniform sampling
     if sample_count > 0:
-        indices = np.linspace(0, total_frames - 1, sample_count).round().astype(int).tolist()
+        if frame_selection == "prefix":
+            # Take a contiguous prefix at a fixed stride, then truncate to
+            # ``sample_count``. This is what the reference video readers do
+            # (``cosmos_framework/data/generator/local_datasets/sft_dataset.py::
+            # process_one_sample`` walks the clip and keeps ``idx % interval == 0``
+            # up to ``end_frame``), so a clip whose length is not already aligned
+            # loses its *tail* rather than being squeezed over the whole range.
+            # ``linspace`` spreads the same number of frames over the whole clip
+            # instead, which selects different frames whenever
+            # ``total_frames != sample_count``.
+            stride = max(1, int(round(total_frames / max(sample_count, 1))))
+            indices = list(range(0, total_frames, stride))[:sample_count]
+            while len(indices) < sample_count:  # only when stride > 1 skipped too far
+                indices.append(min(indices[-1] + 1, total_frames - 1))
+        else:
+            indices = np.linspace(0, total_frames - 1, sample_count).round().astype(int).tolist()
     else:
         indices = []
 
