@@ -261,7 +261,11 @@ per-sample length function and the grouping rule.
 - **Sparse-MoE feed-forwards**: no released Cosmos3 checkpoint is sparse, so only
   dense blocks are built.
 - **MFU**: the shared FLOPs estimator does not price the two-tower layout; derive it
-  from the logged step time and the 720,896 tokens/step.
+  from the logged step time and the 720,896 tokens/step. That figure is the packing
+  *budget*, not an exact count (packs fill to ~99-100%, and online mode estimates
+  prompt length from characters), and the reasoner tower costs 2N FLOPs/token when
+  frozen vs 6N when `train_joint_reasoner: true`, so an MFU derived this way should
+  not be compared as-is between the two modes.
 - **Autoregressive training of the reasoner tower**: joint training fine-tunes it
   through the diffusion loss only; there is no next-token loss, and `lm_head`
   stays frozen.
