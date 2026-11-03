@@ -127,3 +127,26 @@ Examples (data level):
   * input_ids = [A B C D E 0 0 0]
   * position_ids = [0 1 2 3 0 1 2 3]
   * cu_seqlens (padded): [0 4 5 8]
+
+## DiT (diffusion) packing
+
+`DiTTrainer` groups samples by token budget with `data.pack_mode: token_budget`
+(the default `mbs` keeps a fixed `micro_batch_size` samples per micro batch):
+
+```yaml
+data:
+  pack_mode: token_budget
+  max_num_tokens_after_packing: 45056  # token budget of one micro batch
+train:
+  micro_batch_size: 1                  # required in token_budget mode
+  dyn_bsz: true
+```
+
+Only the grouping half of dynamic batching is reused (`DynBszBuffer` /
+`DynamicBatchSizeDataLoader`). `PackingCollator` packs 1-D token streams, while a
+DiT sample is a latent of per-clip geometry, so the tensor-level pack stays in the
+model. The trainer prices samples with the condition model's
+`build_dyn_bsz_length_fn(mm_configs, model_config)`, which reaches the dataloader as
+`build_native_dataloader(..., dyn_bsz_length_fn=...)`; a condition model without it
+cannot use `token_budget`. Cosmos3 is the current user, see
+[its example](../examples/cosmos3.md).
