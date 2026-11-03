@@ -858,9 +858,12 @@ def parallelize_model_fsdp2(
             f"{registered} FSDP module{'s' if registered != 1 else ''}."
         )
 
-    # configure manual prefetching when needed
+    # configure manual prefetching when needed; a plain-FSDP2 model can also ask for it
+    # (``_fsdp_manual_prefetch``) when its blocks would otherwise expose every all-gather.
     need_manual_prefetch = (
-        parallel_state.any_extra_parallel_enabled or mp_ignored_classes is not None
+        parallel_state.any_extra_parallel_enabled
+        or mp_ignored_classes is not None
+        or getattr(model, "_fsdp_manual_prefetch", False)
     ) and kwargs.pop("enable_forward_prefetch", True)
     if need_manual_prefetch:
         blocks = [pair[1][0] for pair in layer_pairs_list]  # all target modules

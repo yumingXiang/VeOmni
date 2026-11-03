@@ -179,10 +179,16 @@ def is_cncl_backend() -> bool:
 
 
 def get_gpu_compute_capability(device: torch.types.Device | int | None = None) -> int:
-    """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU."""
+    """Return the compute capability as an integer (e.g. 70, 80, 90), or 0 if no GPU.
+
+    On Ascend, torch_npu aliases ``torch.cuda`` and ``get_device_capability()`` returns ``None``.
+    """
     if not IS_CUDA_AVAILABLE:
         return 0
-    major, minor = torch.cuda.get_device_capability(device)
+    capability = torch.cuda.get_device_capability(device)
+    if capability is None:
+        return 0
+    major, minor = capability
     return major * 10 + minor
 
 
