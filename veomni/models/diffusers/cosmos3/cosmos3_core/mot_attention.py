@@ -364,24 +364,29 @@ class MotAttention(nn.Module):
         self.to_k = nn.Linear(hidden_size, key_value_out, bias=bias)
         self.to_v = nn.Linear(hidden_size, key_value_out, bias=bias)
         self.to_out = nn.Linear(query_out, hidden_size, bias=bias)
-        self.add_q_proj = nn.Linear(hidden_size, query_out, bias=bias)
-        self.add_k_proj = nn.Linear(hidden_size, key_value_out, bias=bias)
-        self.add_v_proj = nn.Linear(hidden_size, key_value_out, bias=bias)
-        self.to_add_out = nn.Linear(query_out, hidden_size, bias=bias)
 
         def qk_norm(enabled: bool) -> nn.Module:
             return MotRMSNorm(head_dim, eps=eps) if enabled else nn.Identity()
 
+        # Registration order is load-bearing and must not be regrouped: it fixes the order of
+        # ``named_parameters()``, which FSDP2 uses to lay out each block's flat gradient buffer
+        # and its manual-prefetch list. Reordering these submodules leaves the forward bitwise
+        # equal but shifts the last bit of some gradients, which bf16 weights and Adam amplify
+        # into a visibly different grad_norm within two steps at dp=8 (dp=4 is unaffected).
         self.norm_q = qk_norm(config.qk_norm_for_text)
         self.norm_k = qk_norm(config.qk_norm_for_text)
-        self.norm_added_q = qk_norm(config.qk_norm_for_diffusion)
-        self.norm_added_k = qk_norm(config.qk_norm_for_diffusion)
         # Only when the generation pass normalises K but the reasoner does not.
         self.k_norm_und_for_gen = (
             MotRMSNorm(head_dim, eps=eps)
             if config.use_und_k_norm_for_gen and config.qk_norm_for_diffusion and not config.qk_norm_for_text
             else None
         )
+        self.norm_added_q = qk_norm(config.qk_norm_for_diffusion)
+        self.norm_added_k = qk_norm(config.qk_norm_for_diffusion)
+        self.add_q_proj = nn.Linear(hidden_size, query_out, bias=bias)
+        self.add_k_proj = nn.Linear(hidden_size, key_value_out, bias=bias)
+        self.add_v_proj = nn.Linear(hidden_size, key_value_out, bias=bias)
+        self.to_add_out = nn.Linear(query_out, hidden_size, bias=bias)
 
         self.veomni_rope = VeomniOp("rope", "full", resolve_op_impl("rotary_pos_emb_implementation"))
         bind_mot_attention(self)
