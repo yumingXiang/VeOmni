@@ -119,8 +119,6 @@ class Cosmos3MoTTransformer(PreTrainedModel):
     config_class = Cosmos3MoTTransformerConfig
     supports_gradient_checkpointing = True
     _no_split_modules = ["MoTDecoderLayer"]
-    # Prefetch the next block's all-gather; FSDP2 alone leaves it exposed between blocks.
-    _fsdp_manual_prefetch = True
     _keys_to_ignore_on_load_unexpected = [f"^{re.escape(prefix)}" for prefix in IGNORED_CHECKPOINT_KEY_PREFIXES]
 
     def __init__(self, config: Cosmos3MoTTransformerConfig, **kwargs):

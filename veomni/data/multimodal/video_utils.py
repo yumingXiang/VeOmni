@@ -142,13 +142,15 @@ def calculate_frame_indices(
 
     # Uniform sampling
     if sample_count > 0:
-        if frame_selection == "prefix":
+        if frame_selection == "linspace":
+            indices = np.linspace(0, total_frames - 1, sample_count).round().astype(int).tolist()
+        elif frame_selection == "prefix":
             stride = max(1, int(round(total_frames / max(sample_count, 1))))
             indices = list(range(0, total_frames, stride))[:sample_count]
             while len(indices) < sample_count:  # only when stride > 1 skipped too far
                 indices.append(min(indices[-1] + 1, total_frames - 1))
         else:
-            indices = np.linspace(0, total_frames - 1, sample_count).round().astype(int).tolist()
+            raise ValueError(f"frame_selection must be 'linspace' or 'prefix', got {frame_selection!r}.")
     else:
         indices = []
 
@@ -162,6 +164,7 @@ def smart_video_nframes(
     frame_factor: int = None,
     min_frames: int = None,
     max_frames: int = None,
+    frame_selection: str = "linspace",
     **kwargs,
 ) -> tuple[torch.Tensor, Dict[str, Union[float, int, torch.Tensor]]]:
     """Sample video frames with fps and alignment constraints.
@@ -173,6 +176,7 @@ def smart_video_nframes(
         frame_factor: Align output frame count to multiples of this
         min_frames: Minimum frames to output
         max_frames: Maximum frames to output
+        frame_selection: Passed through to ``calculate_frame_indices``.
         **kwargs: Additional arguments (e.g., 'frames' for explicit count)
 
     Returns:
@@ -192,6 +196,7 @@ def smart_video_nframes(
             frame_factor=frame_factor,
             min_frames=target_frames,
             max_frames=target_frames,
+            frame_selection=frame_selection,
         )
     else:
         indices, pad_count = calculate_frame_indices(
@@ -201,6 +206,7 @@ def smart_video_nframes(
             frame_factor=frame_factor,
             min_frames=min_frames,
             max_frames=max_frames,
+            frame_selection=frame_selection,
         )
 
     video = video[indices]

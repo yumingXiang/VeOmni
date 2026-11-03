@@ -135,11 +135,11 @@ Examples (data level):
 
 ```yaml
 data:
+  max_seq_len: 45056                   # token budget of one micro batch
+  dyn_bsz_buffer_size: 1               # decoded clips are large; do not hold the text default
   pack_mode: token_budget
-  max_num_tokens_after_packing: 45056  # token budget of one micro batch
 train:
   micro_batch_size: 1                  # required in token_budget mode
-  dyn_bsz: true
 ```
 
 Only the grouping half of dynamic batching is reused (`DynBszBuffer` /

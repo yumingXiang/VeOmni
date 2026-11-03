@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import json
 import math
 import os
 import pickle as pk
@@ -47,60 +46,9 @@ from .base import BaseTrainer, VeOmniIter
 
 logger = helper.create_logger(__name__)
 
-# Dot-prefixed so ``get_data_files`` skips it and ``offline_training`` can read the fill directory directly.
-LATENT_CACHE_MANIFEST = ".latent_cache_manifest.json"
-
-
-class LatentCacheMismatch(RuntimeError):
-    """A latent cache directory was filled under a different encoding recipe."""
-
-
-def read_latent_cache_manifest(directory: str) -> Optional[Dict[str, Any]]:
-    path = os.path.join(directory, LATENT_CACHE_MANIFEST)
-    if not os.path.isfile(path):
-        return None
-    with open(path, encoding="utf-8") as handle:
-        return json.load(handle)
-
-
-def check_latent_cache_manifest(directory: str, recipe: Any) -> Optional[Dict[str, Any]]:
-    """Raise if ``directory`` was filled under a recipe other than ``recipe``; ``None`` when it records none.
-
-    ``recipe`` is the condition model's ``latent_cache_recipe()``: anything with ``digest()`` and ``as_dict()``.
-    """
-    manifest = read_latent_cache_manifest(directory)
-    if manifest is not None and manifest["recipe"]["digest"] != recipe.digest():
-        current = recipe.as_dict()
-        differing = sorted(key for key, value in manifest["recipe"].items() if current.get(key) != value)
-        raise LatentCacheMismatch(
-            f"The latent cache in {directory!r} was filled under a different encoding recipe (differing: "
-            f"{differing}). Refill it with train.training_task='offline_embedding' into a fresh directory."
-        )
-    return manifest
-
-
-def write_latent_cache_manifest(directory: str, recipe: Any, **extra: Any) -> None:
-    path = os.path.join(directory, LATENT_CACHE_MANIFEST)
-    # Every rank writes while others read: replace atomically.
-    temporary = f"{path}.{os.getpid()}.tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump({"recipe": recipe.as_dict(), **extra}, handle, indent=2, sort_keys=True)
-    os.replace(temporary, path)
-
 
 class OfflineEmbeddingSaver:
-    """Positional parquet export of condition rows for ``offline_training``.
-
-    With a ``recipe`` (the condition model's ``latent_cache_recipe()``), every row is also
-    stored under ``latent_cache/`` by its content key, so a re-run only encodes samples
-    it has not seen, and the directory records the recipe it was filled under.
-    """
-
-    CACHE_DIRNAME = "latent_cache"
-
-    def __init__(
-        self, save_path: str, dataset_length: int = 0, shard_num: int = 1, max_shard=1000, recipe: Any = None
-    ):
+    def __init__(self, save_path: str, dataset_length: int = 0, shard_num: int = 1, max_shard=1000):
         from ..distributed.parallel_state import get_parallel_state
 
         self.dp_rank = get_parallel_state().dp_rank
@@ -119,44 +67,6 @@ class OfflineEmbeddingSaver:
         logger.info(f"Rank [{self.dp_rank}] save to [{self.save_path}] each batch_len [{self.batch_len}].")
         os.makedirs(self.save_path, exist_ok=True)
         self.rest_len = self.dataset_length
-
-        self.recipe = recipe
-        self.cache_hits = 0
-        self.cache_misses = 0
-        if recipe is not None:
-            self._open_cache()
-
-    def _open_cache(self) -> None:
-        shards = [name for name in os.listdir(self.save_path) if name.endswith(".parquet")]
-        if check_latent_cache_manifest(self.save_path, self.recipe) is None and shards:
-            raise LatentCacheMismatch(
-                f"{self.save_path!r} holds parquet shards but no {LATENT_CACHE_MANIFEST}, so nothing records the "
-                "recipe that produced them; fill a fresh data.offline_embedding_save_dir."
-            )
-        os.makedirs(os.path.join(self.save_path, self.CACHE_DIRNAME), exist_ok=True)
-        write_latent_cache_manifest(self.save_path, self.recipe, dataset_length=self.dataset_length)
-        # Resume the positional export after the shards this rank already wrote.
-        prefix = f"rank_{self.dp_rank}_shard_"
-        used = [int(name[len(prefix) : -len(".parquet")]) for name in shards if name.startswith(prefix)]
-        self.index = max(used) + 1 if used else 0
-
-    def _cache_path(self, cache_key: str) -> str:
-        return os.path.join(self.save_path, self.CACHE_DIRNAME, cache_key[:2], f"{cache_key}.pt")
-
-    def load(self, cache_key: str) -> Optional[Dict[str, Any]]:
-        """The cached condition row for ``cache_key``, or ``None``."""
-        path = self._cache_path(cache_key)
-        if not os.path.isfile(path):
-            return None
-        return torch.load(path, map_location="cpu", weights_only=False)
-
-    def _store(self, cache_key: str, save_item: Dict[str, Any]) -> None:
-        path = self._cache_path(cache_key)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Write-then-rename: an interrupted fill must not leave an entry a later run counts as a hit.
-        temporary = f"{path}.{os.getpid()}.tmp"
-        torch.save(self._cpu_recursive(dict(save_item)), temporary)
-        os.replace(temporary, path)
 
     @staticmethod
     def _cpu_recursive(obj):
@@ -181,10 +91,7 @@ class OfflineEmbeddingSaver:
             self.buffer.append(self.to_save_bytes(save_item))
             self.rest_len -= 1
 
-    def save(self, save_item, cache_key: Optional[str] = None):
-        if cache_key is not None and not os.path.isfile(self._cache_path(cache_key)):
-            self._store(cache_key, save_item)
-            self.cache_misses += 1
+    def save(self, save_item):
         self._append_item(save_item)
         if len(self.buffer) >= self.batch_len:
             ds = Dataset.from_list(self.buffer)
@@ -198,11 +105,6 @@ class OfflineEmbeddingSaver:
             ds.to_parquet(os.path.join(self.save_path, f"rank_{self.dp_rank}_shard_{self.index}.parquet"))
             self.buffer = []
             self.index += 1
-        if self.recipe is not None:
-            write_latent_cache_manifest(self.save_path, self.recipe, dataset_length=self.dataset_length)
-            logger.info(
-                f"Rank [{self.dp_rank}] latent cache: {self.cache_misses} sample(s) encoded, {self.cache_hits} reused."
-            )
 
 
 @dataclass
@@ -253,19 +155,8 @@ class DiTDataArguments(DataArguments):
         default="mbs",
         metadata={
             "help": "How samples are grouped into micro batches. 'mbs': a fixed `train.micro_batch_size` samples. "
-            "'token_budget': greedily up to `max_num_tokens_after_packing` tokens per micro batch, priced by the "
-            "condition model's `build_dyn_bsz_length_fn`; `train.micro_batch_size` must then be 1."
-        },
-    )
-    max_num_tokens_after_packing: Optional[int] = field(
-        default=None,
-        metadata={"help": "Token budget of one micro batch for pack_mode='token_budget'; None uses data.max_seq_len."},
-    )
-    pack_buffer_size: int = field(
-        default=1,
-        metadata={
-            "help": "Samples the token-budget batcher holds before emitting a micro batch (the DiT replacement for "
-            "data.dyn_bsz_buffer_size, whose text default would pin hundreds of decoded clips in host memory)."
+            "'token_budget': greedily up to `data.max_seq_len` tokens per micro batch, priced by the condition "
+            "model's `build_dyn_bsz_length_fn`; `train.micro_batch_size` must then be 1."
         },
     )
     log_sample: bool = field(
@@ -471,20 +362,18 @@ class DiTTrainer:
         args: VeOmniDiTArguments = self.base.args
         # registers ParallelState("base") before seed
         self.base.device = self.base._setup(args)
-        if args.data.pack_mode not in ("token_budget", "mbs"):
-            raise ValueError(f"data.pack_mode={args.data.pack_mode!r} is not supported; use 'token_budget' or 'mbs'.")
+        # data.pack_mode is the only DiT switch; train.dyn_bsz is derived for the shared code that reads it.
         args.train.dyn_bsz = args.data.pack_mode == "token_budget"
-        # dataloader_batch_size was computed in __post_init__ from the config's dyn_bsz; recompute it.
-        if not args.train.dyn_bsz:
-            args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
-        elif args.train.micro_batch_size != 1:
+        if args.train.dyn_bsz and args.train.micro_batch_size != 1:
             raise ValueError(
                 "data.pack_mode='token_budget' packs one micro batch per sample group; set micro_batch_size=1."
             )
-        elif args.train.dyn_bsz_runtime == "main":
-            args.train.dataloader_batch_size = 1
-        else:
-            args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
+        # __post_init__ derived this from the global train.dyn_bsz rather than from pack_mode, so redo it.
+        args.train.dataloader_batch_size = (
+            1
+            if args.train.dyn_bsz and args.train.dyn_bsz_runtime == "main"
+            else args.train.global_batch_size // get_parallel_state().dp_size
+        )
         if args.train.training_task == "offline_embedding":
             assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
             if args.data.offline_embedding_save_dir is None:
@@ -536,7 +425,6 @@ class DiTTrainer:
                 self.offline_embedding_saver = OfflineEmbeddingSaver(
                     save_path=self.offline_embedding_save_dir,
                     dataset_length=valid_data_length,
-                    recipe=self._latent_cache_recipe(),
                 )
                 padded_len = (
                     math.ceil(self.base.train_dataset.data_len / args.train.global_batch_size)
@@ -548,12 +436,6 @@ class DiTTrainer:
                 self.base.train_steps = args.train_steps
             else:
                 self.offline_embedding_saver = None
-        elif self.training_task == "offline_training":
-            recipe = self._latent_cache_recipe()
-            if recipe is not None and check_latent_cache_manifest(args.data.train_path, recipe) is None:
-                logger.warning_rank0(
-                    f"{args.data.train_path!r} records no latent cache recipe; it cannot be checked against this run."
-                )
 
         # Sync _train_steps across the SP group AFTER padding so every rank
         # agrees on step count (required to avoid deadlocks in broadcast_object_list).
@@ -569,15 +451,10 @@ class DiTTrainer:
             args._train_steps = int(steps_t.item())
             self.base.train_steps = args.train_steps
 
-    def _latent_cache_recipe(self) -> Any:
-        """The condition model's latent encoding recipe, or ``None`` when it has none."""
-        builder = getattr(self.condition_model, "latent_cache_recipe", None)
-        return builder() if builder is not None else None
-
     def _build_dataloader(self):
         """Fixed sample count per micro batch, or token-budget packing (``data.pack_mode``)."""
         args = self.base.args
-        max_seq_len, length_fn, buffer_size = args.data.max_seq_len, None, args.data.dyn_bsz_buffer_size
+        length_fn = None
         if args.train.dyn_bsz:
             builder = getattr(self.condition_model, "build_dyn_bsz_length_fn", None)
             if builder is None:
@@ -585,8 +462,6 @@ class DiTTrainer:
                     f"data.pack_mode='token_budget' needs {type(self.condition_model).__name__}.build_dyn_bsz_length_fn."
                 )
             length_fn = builder(args.data.mm_configs, self.base.model.model_config)
-            max_seq_len = args.data.max_num_tokens_after_packing or args.data.max_seq_len
-            buffer_size = args.data.pack_buffer_size
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
             self.base.train_dataloader = build_dataloader(
                 dataloader_type=args.data.dataloader.type,
@@ -594,7 +469,7 @@ class DiTTrainer:
                 micro_batch_size=args.train.micro_batch_size,
                 global_batch_size=args.train.global_batch_size,
                 dataloader_batch_size=args.train.dataloader_batch_size,
-                max_seq_len=max_seq_len,
+                max_seq_len=args.data.max_seq_len,
                 train_steps=args.train_steps,
                 bsz_warmup_ratio=args.train.bsz_warmup_ratio,
                 bsz_warmup_init_mbtoken=args.train.bsz_warmup_init_mbtoken,
@@ -603,7 +478,7 @@ class DiTTrainer:
                 dyn_bsz_count_mode=args.train.dyn_bsz_count_mode,
                 dyn_bsz_length_fn=length_fn,
                 dyn_bsz_physical_overflow_ratio=args.train.dyn_bsz_physical_overflow_ratio,
-                dyn_bsz_buffer_size=buffer_size,
+                dyn_bsz_buffer_size=args.data.dyn_bsz_buffer_size,
                 num_workers=args.data.dataloader.num_workers,
                 drop_last=args.data.dataloader.drop_last,
                 pin_memory=args.data.dataloader.pin_memory,
@@ -671,44 +546,18 @@ class DiTTrainer:
         num_items = len(batch[keys[0]])
         return [{k: batch[k][idx] for k in keys} for idx in range(num_items)]
 
-    def _save_offline_embeddings(self, micro_batch: Dict[str, Any]) -> None:
-        saver = self.offline_embedding_saver
-        if saver is None or saver.recipe is None:
-            micro_batch = self.preforward(micro_batch)
-            with torch.no_grad():
-                condition = self.condition_model.get_condition(**micro_batch)
-            if saver is not None:  # sp_rank 0 saves
-                for item in self._unpack_dict_of_list(condition):
-                    saver.save(item)
-            return
-
-        # Keys come from the CPU batch (they hash the decoded clips); only cache misses are encoded,
-        # and rows are exported in dataset order because offline_training replays them by position.
-        keys = self.condition_model.latent_cache_keys(micro_batch)
-        rows = [saver.load(key) for key in keys]
-        missing = [index for index, row in enumerate(rows) if row is None]
-        saver.cache_hits += len(keys) - len(missing)
-        if missing:
-            subset = {
-                name: [value[index] for index in missing] if isinstance(value, list) else value
-                for name, value in micro_batch.items()
-            }
-            with torch.no_grad():
-                condition = self.condition_model.get_condition(**self.preforward(subset))
-            for index, item in zip(missing, self._unpack_dict_of_list(condition)):
-                rows[index] = item
-        for key, row in zip(keys, rows):
-            saver.save(row, cache_key=key)
-
     def forward_backward_step(self, micro_batch: Dict[str, torch.Tensor]) -> tuple:
-        if self.training_task == "offline_embedding":
-            self._save_offline_embeddings(micro_batch)
-            return 0.0, {}
-
         micro_batch = self.preforward(micro_batch)
-        if self.training_task == "online_training":
+        if self.training_task == "online_training" or self.training_task == "offline_embedding":
             with torch.no_grad():
                 micro_batch = self.condition_model.get_condition(**micro_batch)
+
+        if self.training_task == "offline_embedding":
+            if self.offline_embedding_saver is not None:  # sp_rank 0 save
+                for item in self._unpack_dict_of_list(micro_batch):
+                    self.offline_embedding_saver.save(item)
+            del micro_batch
+            return 0.0, {}
 
         with torch.no_grad():
             micro_batch = self.condition_model.process_condition(**micro_batch)

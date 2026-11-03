@@ -8,8 +8,7 @@ whether to loop over samples, batch or pack them, or reject unsupported inputs.
 This page describes `data.pack_mode = mbs` (the default), where
 `micro_batch_size` counts *samples*. `data.pack_mode = token_budget` switches the
 same trainer to token-budget scheduling -- `micro_batch_size` then counts *packed
-micro batches* and samples are greedily packed up to
-`data.max_num_tokens_after_packing`; see
+micro batches* and samples are greedily packed up to `data.max_seq_len`; see
 [DiT packing](data_packing_and_dyn_bsz.md#dit-diffusion-packing).
 
 ## Training batch sizes

@@ -983,9 +983,7 @@ derived argument groups below.
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
 | offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
-| pack_mode | `Literal["token_budget", "mbs"]` | `"mbs"` | How samples are grouped into micro batches. `"mbs"`: a fixed `train.micro_batch_size` samples. `"token_budget"`: greedily up to `max_num_tokens_after_packing` tokens per micro batch, priced by the condition model's `build_dyn_bsz_length_fn`; `train.micro_batch_size` must then be 1. |
-| max_num_tokens_after_packing | `Optional[int]` | `None` | Token budget of one packed micro batch when `pack_mode="token_budget"`. `None` falls back to `data.max_seq_len`. |
-| pack_buffer_size | `int` | `1` | Samples the token-budget batcher holds before emitting a micro batch (the DiT replacement for `data.dyn_bsz_buffer_size`, whose text default would pin hundreds of decoded clips). |
+| pack_mode | `Literal["token_budget", "mbs"]` | `"mbs"` | How samples are grouped into micro batches. `"mbs"`: a fixed `train.micro_batch_size` samples. `"token_budget"`: greedily up to `data.max_seq_len` tokens per micro batch, priced by the condition model's `build_dyn_bsz_length_fn`; it sets `train.dyn_bsz` and requires `train.micro_batch_size=1`. |
 
 `build_native_dataloader(..., dyn_bsz_length_fn=None)` is the extension point behind
 `pack_mode="token_budget"`: a picklable per-sample token cost. `None` keeps

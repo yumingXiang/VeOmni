@@ -20,7 +20,6 @@ from .....distributed.parallel_state import get_parallel_state
 from .....utils import logging
 from ..cosmos3_core import TrainTimeSampler, interpolate
 from .configuration_cosmos3_condition import Cosmos3ConditionModelConfig
-from .latent_cache import LatentRecipe, checkpoint_digest, latent_cache_key, tokenizer_digest
 from .packing import build_cosmos3_length_fn
 from .wan22_vae import Wan22VAE
 
@@ -38,7 +37,6 @@ class Cosmos3ConditionModel(PreTrainedModel):
         self.generator = torch.Generator(device="cpu")
         self.generator.manual_seed(int(config.seed if config.seed is not None else 42) + get_parallel_state().dp_rank)
         self.train_time_sampler = TrainTimeSampler(config.train_time_video_distribution)
-        self._latent_cache_recipe: Optional[LatentRecipe] = None
         self._logged_geometry = False
 
         if not config.base_model_path:
@@ -93,43 +91,10 @@ class Cosmos3ConditionModel(PreTrainedModel):
     def load_rng_state_dict(self, state: dict[str, torch.Tensor]) -> None:
         self.generator.set_state(state["generator"])
 
-    # ── DiTTrainer hooks: token-budget packing and the latent cache ──────────────
+    # ── DiTTrainer hook: token-budget packing ────────────────────────────────────
 
     def build_dyn_bsz_length_fn(self, mm_configs, model_config):
         return build_cosmos3_length_fn(mm_configs, model_config)
-
-    def latent_cache_recipe(self) -> LatentRecipe:
-        """Memoized: it hashes the VAE checkpoint files."""
-        if self._latent_cache_recipe is None:
-            vae_config = self.vae.config
-            stats = ",".join(repr(float(v)) for v in [*vae_config.latents_mean, *vae_config.latents_std])
-            self._latent_cache_recipe = LatentRecipe(
-                vae_dtype=str(self.config.vae_dtype),
-                vae_weights=checkpoint_digest(self.config.component_dir(self.config.vae_subfolder)),
-                latents_stats=stats,
-                tokenizer=tokenizer_digest(self.tokenizer, self.config.max_sequence_length),
-                latent_patch_size=int(self.config.latent_patch_size),
-                spatial_scale=self.vae.spatial_scale,
-                temporal_scale=self.vae.temporal_scale,
-                resolution=str(self.config.resolution),
-            )
-        return self._latent_cache_recipe
-
-    def latent_cache_keys(self, micro_batch: dict[str, Any]) -> list[str]:
-        """One key per sample of a CPU-resident collated batch."""
-        keys = []
-        for prompt, entry in zip(micro_batch["inputs"], micro_batch["videos"]):
-            frames = self._frames(entry)
-            target_h, target_w = self._latent_grid_target(int(frames.shape[2]), int(frames.shape[3]))
-            keys.append(
-                latent_cache_key(
-                    self.latent_cache_recipe(),
-                    prompt=prompt,
-                    frames=frames,
-                    fed_geometry=(int(frames.shape[0]), int(frames.shape[1]), target_h, target_w),
-                )
-            )
-        return keys
 
     # ── get_condition: raw data -> clean latents and prompt tokens ────────────────
 
