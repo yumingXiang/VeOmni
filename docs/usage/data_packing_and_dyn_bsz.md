@@ -127,3 +127,27 @@ Examples (data level):
   * input_ids = [A B C D E 0 0 0]
   * position_ids = [0 1 2 3 0 1 2 3]
   * cu_seqlens (padded): [0 4 5 8]
+
+## DiT (diffusion) packing
+
+`DiTTrainer` groups samples by token budget when a recipe sets `train.dyn_bsz: true`
+(the default fixed-sample batching keeps `micro_batch_size` samples per micro batch):
+
+```yaml
+data:
+  max_seq_len: 45056                   # token budget of one micro batch
+  dyn_bsz_buffer_size: 1               # decoded clips are large; do not hold the text default
+train:
+  dyn_bsz: true                        # requires the condition model to price a sample
+  micro_batch_size: 1                  # required with dyn_bsz
+```
+
+Only the grouping half of dynamic batching is reused (`DynBszBuffer` /
+`DynamicBatchSizeDataLoader`). `PackingCollator` packs 1-D token streams, while a
+DiT sample is a latent of per-clip geometry, so the tensor-level pack stays in the
+model. The trainer prices samples with the condition model's
+`build_dyn_bsz_length_fn(mm_configs, model_config)`, which reaches the dataloader as
+`build_native_dataloader(..., dyn_bsz_length_fn=...)`; a condition model without it
+keeps fixed-sample batching. That fallback is silent -- `train.dyn_bsz` defaults to
+`true`, so the trainer cannot distinguish an explicit request from the shared
+default. Cosmos3 is the current user, see [its example](../examples/cosmos3.md).
