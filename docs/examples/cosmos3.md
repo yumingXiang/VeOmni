@@ -243,14 +243,14 @@ a fixed number of clips:
 data:
   max_seq_len: 45056         # the token budget of one packed micro batch
   dyn_bsz_buffer_size: 1     # decoded clips are large; do not hold the text default
-  pack_mode: token_budget
 train:
+  dyn_bsz: true            # token-budget grouping; Cosmos3 prices each clip itself
   micro_batch_size: 1      # one *packed* micro batch
   global_batch_size: 16    # 8 ranks x 2 micro batches -> 16 x 45056 = 720,896 tokens/step
 ```
 
-`pack_mode: mbs` (the default) keeps the older meaning: `micro_batch_size`
-counts samples. Either way the samples are run as one packed TND sequence, so
+Without `train.dyn_bsz` the older meaning applies: `micro_batch_size` counts
+samples. Either way the samples are run as one packed TND sequence, so
 cross-sample isolation is structural rather than mask-based. See
 [DiT packing](../usage/data_packing_and_dyn_bsz.md#dit-diffusion-packing) for the
 per-sample length function and the grouping rule.

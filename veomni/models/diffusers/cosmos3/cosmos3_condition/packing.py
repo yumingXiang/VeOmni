@@ -1,4 +1,4 @@
-"""Per-sample token cost for ``data.pack_mode: token_budget`` (the reference's ``PackingDataLoader``).
+"""Per-sample token cost for token-budget batching (the reference's ``PackingDataLoader``).
 
 Mirrors the reference's ``SampleTokenCounter``: ``und = prompt tokens + 1`` (eos)
 and ``gen = ceil(h_lat / p) * ceil(w_lat / p) * t_lat + 2`` (vision markers). The

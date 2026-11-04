@@ -983,12 +983,13 @@ derived argument groups below.
 | --- | --- | --- | --- |
 | mm_configs | `Optional[Dict]` | `{}` | Multimodal input configuration. |
 | offline_embedding_save_dir | `Optional[str]` | `None` | Directory used to save offline embeddings. |
-| pack_mode | `Literal["token_budget", "mbs"]` | `"mbs"` | How samples are grouped into micro batches. `"mbs"`: a fixed `train.micro_batch_size` samples. `"token_budget"`: greedily up to `data.max_seq_len` tokens per micro batch, priced by the condition model's `build_dyn_bsz_length_fn`; it sets `train.dyn_bsz` and requires `train.micro_batch_size=1`. |
 
-`build_native_dataloader(..., dyn_bsz_length_fn=None)` is the extension point behind
-`pack_mode="token_budget"`: a picklable per-sample token cost. `None` keeps
+`build_native_dataloader(..., dyn_bsz_length_fn=None)` is the extension point behind DiT
+token-budget batching: a picklable per-sample token cost. `None` keeps
 `get_length_fn_by_count_mode(dyn_bsz_count_mode)`; `DiTTrainer` passes the condition model's
-`build_dyn_bsz_length_fn(mm_configs, model_config)`.
+`build_dyn_bsz_length_fn(mm_configs, model_config)` when a recipe sets `train.dyn_bsz: true`
+(which then requires `train.micro_batch_size: 1`). A condition model without that method keeps
+fixed-sample batching.
 
 ### DiTTrainingArguments
 

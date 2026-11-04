@@ -1,7 +1,7 @@
 """Unit tests for the shared-side entry points added by the Cosmos3 port.
 
-Covers the four public additions plus the config invariant that keeps
-``data.pack_mode`` the only DiT batching switch.
+Covers the four public additions plus the config invariant that keeps DiT batching
+on ``train.dyn_bsz`` alone.
 """
 
 import dataclasses
@@ -231,20 +231,19 @@ def test_cosmos3_preprocess_cfg_dropout_thresholds_on_the_global_rng(monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# data.pack_mode is the only DiT batching switch
+# DiT token-budget batching reuses train.dyn_bsz, gated on the condition model
 # ---------------------------------------------------------------------------
 
 
-def test_pack_mode_field_defaults_to_mbs():
+def test_dit_data_arguments_has_no_batching_field_of_its_own():
+    """Batching is ``train.dyn_bsz``; a second switch would be another source of truth."""
     from veomni.trainer.dit_trainer import DiTDataArguments
 
-    fields = {f.name: f for f in dataclasses.fields(DiTDataArguments)}
-    assert "pack_mode" in fields
-    assert fields["pack_mode"].default == "mbs"
+    names = {f.name for f in dataclasses.fields(DiTDataArguments)}
+    assert "pack_mode" not in names
 
 
-def test_cosmos3_recipes_set_pack_mode_and_no_train_dyn_bsz():
-    """A stray ``train.dyn_bsz`` would reintroduce a second source of truth for batching."""
+def test_cosmos3_recipes_enable_dyn_bsz():
     from pathlib import Path
 
     import yaml
@@ -253,6 +252,6 @@ def test_cosmos3_recipes_set_pack_mode_and_no_train_dyn_bsz():
     names = ["cosmos3_sft.yaml", "cosmos3_sft_offline.yaml", "cosmos3_sft_embedding.yaml"]
     for name in names:
         cfg = yaml.safe_load((recipes / name).read_text())
-        assert cfg["data"]["pack_mode"] == "token_budget", name
-        assert "dyn_bsz" not in cfg.get("train", {}), name
+        assert cfg["train"]["dyn_bsz"] is True, name
         assert cfg["train"]["micro_batch_size"] == 1, name
+        assert "pack_mode" not in cfg.get("data", {}), name

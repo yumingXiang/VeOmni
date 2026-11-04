@@ -130,16 +130,16 @@ Examples (data level):
 
 ## DiT (diffusion) packing
 
-`DiTTrainer` groups samples by token budget with `data.pack_mode: token_budget`
-(the default `mbs` keeps a fixed `micro_batch_size` samples per micro batch):
+`DiTTrainer` groups samples by token budget when a recipe sets `train.dyn_bsz: true`
+(the default fixed-sample batching keeps `micro_batch_size` samples per micro batch):
 
 ```yaml
 data:
   max_seq_len: 45056                   # token budget of one micro batch
   dyn_bsz_buffer_size: 1               # decoded clips are large; do not hold the text default
-  pack_mode: token_budget
 train:
-  micro_batch_size: 1                  # required in token_budget mode
+  dyn_bsz: true                        # requires the condition model to price a sample
+  micro_batch_size: 1                  # required with dyn_bsz
 ```
 
 Only the grouping half of dynamic batching is reused (`DynBszBuffer` /
@@ -148,5 +148,5 @@ DiT sample is a latent of per-clip geometry, so the tensor-level pack stays in t
 model. The trainer prices samples with the condition model's
 `build_dyn_bsz_length_fn(mm_configs, model_config)`, which reaches the dataloader as
 `build_native_dataloader(..., dyn_bsz_length_fn=...)`; a condition model without it
-cannot use `token_budget`. Cosmos3 is the current user, see
-[its example](../examples/cosmos3.md).
+keeps fixed-sample batching and the trainer logs a warning. Cosmos3 is the current
+user, see [its example](../examples/cosmos3.md).

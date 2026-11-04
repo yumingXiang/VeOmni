@@ -5,15 +5,18 @@ Existing recipes with `micro_batch_size: 1` are unchanged. A larger microbatch
 does not automatically enable packing or guarantee a speedup: each model decides
 whether to loop over samples, batch or pack them, or reject unsupported inputs.
 
-This page describes `data.pack_mode = mbs` (the default), where
-`micro_batch_size` counts *samples*. `data.pack_mode = token_budget` switches the
-same trainer to token-budget scheduling -- `micro_batch_size` then counts *packed
-micro batches* and samples are greedily packed up to `data.max_seq_len`; see
-[DiT packing](data_packing_and_dyn_bsz.md#dit-diffusion-packing).
+This page describes the default, where `micro_batch_size` counts *samples*.
+Setting `train.dyn_bsz: true` on a DiT recipe switches the same trainer to
+token-budget scheduling -- `micro_batch_size` must then be 1 and samples are
+greedily packed up to `data.max_seq_len`; see
+[DiT packing](data_packing_and_dyn_bsz.md#dit-diffusion-packing). That only takes
+effect when the condition model can price a sample
+(`build_dyn_bsz_length_fn`); otherwise the trainer keeps fixed-sample batching and
+logs a warning.
 
 ## Training batch sizes
 
-With `pack_mode = mbs`, DiT keeps `train.dyn_bsz = false`. With microbatch size `M`,
+With fixed-sample batching, DiT keeps `train.dyn_bsz = false`. With microbatch size `M`,
 data-parallel size `D`, and `K` gradient-accumulation microbatches per optimizer step:
 
 ```text
@@ -66,9 +69,9 @@ Packing, valid-token selection, multimodal layouts, attention boundaries,
 positions and output reconstruction remain inside modeling. SP/CP slicing also
 belongs there, after patchification where applicable, not in the DiT collator.
 A model that cannot handle a multi-sample or parallel configuration must reject
-it itself. The trainer's only packing input is `data.pack_mode` (how many samples
-share a micro batch, see above); the tensor-level pack and the sample/output
-protocol stay model-owned.
+it itself. The trainer's only packing input is `train.dyn_bsz` (whether samples are
+greedily packed to a token budget, see above); the tensor-level pack and the
+sample/output protocol stay model-owned.
 
 This is fixed-sample batching, independent of the token-budget scheduling used
 by dynamic batching. A larger microbatch does not imply packing for every model.

@@ -151,14 +151,6 @@ class DiTDataArguments(DataArguments):
             "When None, DiTTrainer picks dit_offline/dit_online by training_task."
         },
     )
-    pack_mode: Literal["token_budget", "mbs"] = field(
-        default="mbs",
-        metadata={
-            "help": "How samples are grouped into micro batches. 'mbs': a fixed `train.micro_batch_size` samples. "
-            "'token_budget': greedily up to `data.max_seq_len` tokens per micro batch, priced by the condition "
-            "model's `build_dyn_bsz_length_fn`; `train.micro_batch_size` must then be 1."
-        },
-    )
     log_sample: bool = field(
         default=True,
         metadata={"help": "Whether to print the first micro batch example to the log."},
@@ -362,18 +354,6 @@ class DiTTrainer:
         args: VeOmniDiTArguments = self.base.args
         # registers ParallelState("base") before seed
         self.base.device = self.base._setup(args)
-        # data.pack_mode is the only DiT switch; train.dyn_bsz is derived for the shared code that reads it.
-        args.train.dyn_bsz = args.data.pack_mode == "token_budget"
-        if args.train.dyn_bsz and args.train.micro_batch_size != 1:
-            raise ValueError(
-                "data.pack_mode='token_budget' packs one micro batch per sample group; set micro_batch_size=1."
-            )
-        # __post_init__ derived this from the global train.dyn_bsz rather than from pack_mode, so redo it.
-        args.train.dataloader_batch_size = (
-            1
-            if args.train.dyn_bsz and args.train.dyn_bsz_runtime == "main"
-            else args.train.global_batch_size // get_parallel_state().dp_size
-        )
         if args.train.training_task == "offline_embedding":
             assert args.data.datasets_type == "mapping", "Datasets type must be mapping for offline embedding."
             if args.data.offline_embedding_save_dir is None:
@@ -409,6 +389,17 @@ class DiTTrainer:
 
     def _build_dataset(self):
         args: VeOmniDiTArguments = self.base.args
+        # Token-budget grouping needs the condition model to price a sample, so a DiT run only takes
+        # ``train.dyn_bsz`` when the model provides ``build_dyn_bsz_length_fn``; otherwise it keeps the
+        # fixed-sample batching (the shared default is True, for the text models).
+        self._dyn_bsz_length_fn = getattr(self.condition_model, "build_dyn_bsz_length_fn", None)
+        args.train.dyn_bsz = args.train.dyn_bsz and self._dyn_bsz_length_fn is not None
+        if args.train.dyn_bsz and args.train.micro_batch_size != 1:
+            raise ValueError("train.dyn_bsz=True packs one micro batch per sample group; set micro_batch_size=1.")
+        if not args.train.dyn_bsz:
+            # __post_init__ left this at 1 (the config default is dyn_bsz=True); restore the fixed path.
+            args.train.dataloader_batch_size = args.train.global_batch_size // get_parallel_state().dp_size
+
         self.base._build_dataset()
         if get_parallel_state().sp_enabled and get_parallel_state().sp_rank != 0:
             self.base.train_dataset = None
@@ -452,16 +443,11 @@ class DiTTrainer:
             self.base.train_steps = args.train_steps
 
     def _build_dataloader(self):
-        """Fixed sample count per micro batch, or token-budget packing (``data.pack_mode``)."""
+        """Build dataloader with dyn_bsz=False for DiT (fixed batch), unless the condition model prices samples."""
         args = self.base.args
         length_fn = None
         if args.train.dyn_bsz:
-            builder = getattr(self.condition_model, "build_dyn_bsz_length_fn", None)
-            if builder is None:
-                raise ValueError(
-                    f"data.pack_mode='token_budget' needs {type(self.condition_model).__name__}.build_dyn_bsz_length_fn."
-                )
-            length_fn = builder(args.data.mm_configs, self.base.model.model_config)
+            length_fn = self._dyn_bsz_length_fn(args.data.mm_configs, self.base.model.model_config)
         if not get_parallel_state().sp_enabled or get_parallel_state().sp_rank == 0:
             self.base.train_dataloader = build_dataloader(
                 dataloader_type=args.data.dataloader.type,

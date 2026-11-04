@@ -65,7 +65,6 @@ data:
   max_seq_len: 45056
   dyn_bsz_buffer_size: 1
   log_sample: false
-  pack_mode: token_budget  # greedy packing to max_seq_len tokens per micro batch, like the reference
   source_name: cosmos3_sft_jsonl
   data_transform: dit_offline
   dataloader:
@@ -87,6 +86,7 @@ train:
   training_task: offline_training
   global_batch_size: 16
   micro_batch_size: 1
+  dyn_bsz: true
   bsz_warmup_ratio: 0.0
   max_steps: 500
   num_train_epochs: 1
