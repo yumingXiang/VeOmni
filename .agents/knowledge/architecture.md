@@ -206,11 +206,13 @@ and YAML inputs.
 
 ## DiT Fixed Microbatches
 
-`DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false` under
-`data.pack_mode="mbs"` (the default); `data.pack_mode="token_budget"` instead runs
-the shared token-budget (dyn-bsz) dataloader with a DiT-specific per-sample length
-function (`build_native_dataloader(..., dyn_bsz_length_fn=...)`), and
-`micro_batch_size` then counts packed micro batches.
+`DiTTrainer` honors `train.micro_batch_size` and keeps `dyn_bsz=false` unless the
+condition model can price a sample. With `build_dyn_bsz_length_fn`, a recipe's
+`train.dyn_bsz: true` runs the shared token-budget (dyn-bsz) dataloader through
+`build_native_dataloader(..., dyn_bsz_length_fn=...)`, and `micro_batch_size` then
+counts packed micro batches; a model without the hook is silently kept on
+fixed-sample batching (`train.dyn_bsz` defaults to `true`, so an explicit request
+cannot be told apart from the shared default, and nothing is logged).
 `DiTDataCollator` produces dict-of-lists microbatches; the existing
 `get_condition` / `process_condition` / model-forward path is unchanged.
 Models return sample-mean scalar losses, and the trainer divides by the number

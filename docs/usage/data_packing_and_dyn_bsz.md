@@ -148,5 +148,6 @@ DiT sample is a latent of per-clip geometry, so the tensor-level pack stays in t
 model. The trainer prices samples with the condition model's
 `build_dyn_bsz_length_fn(mm_configs, model_config)`, which reaches the dataloader as
 `build_native_dataloader(..., dyn_bsz_length_fn=...)`; a condition model without it
-keeps fixed-sample batching and the trainer logs a warning. Cosmos3 is the current
-user, see [its example](../examples/cosmos3.md).
+keeps fixed-sample batching. That fallback is silent -- `train.dyn_bsz` defaults to
+`true`, so the trainer cannot distinguish an explicit request from the shared
+default. Cosmos3 is the current user, see [its example](../examples/cosmos3.md).

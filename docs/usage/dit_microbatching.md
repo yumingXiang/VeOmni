@@ -11,8 +11,10 @@ token-budget scheduling -- `micro_batch_size` must then be 1 and samples are
 greedily packed up to `data.max_seq_len`; see
 [DiT packing](data_packing_and_dyn_bsz.md#dit-diffusion-packing). That only takes
 effect when the condition model can price a sample
-(`build_dyn_bsz_length_fn`); otherwise the trainer keeps fixed-sample batching and
-logs a warning.
+(`build_dyn_bsz_length_fn`); otherwise batching stays fixed-sample. That fallback
+logs nothing: `train.dyn_bsz` defaults to `true`, so the trainer cannot tell an
+explicit request from the shared default, and any message would fire for every DiT
+recipe that never set the field.
 
 ## Training batch sizes
 
