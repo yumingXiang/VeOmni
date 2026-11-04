@@ -145,10 +145,12 @@ def calculate_frame_indices(
         if frame_selection == "linspace":
             indices = np.linspace(0, total_frames - 1, sample_count).round().astype(int).tolist()
         elif frame_selection == "prefix":
+            # A fixed stride can land on fewer frames than asked for on a short clip; report the
+            # shortfall through ``pad_count`` (the caller repeats the last frame) rather than
+            # fabricating duplicate indices, which would feed the VAE a stale frame silently.
             stride = max(1, int(round(total_frames / max(sample_count, 1))))
             indices = list(range(0, total_frames, stride))[:sample_count]
-            while len(indices) < sample_count:  # only when stride > 1 skipped too far
-                indices.append(min(indices[-1] + 1, total_frames - 1))
+            pad_count += sample_count - len(indices)
         else:
             raise ValueError(f"frame_selection must be 'linspace' or 'prefix', got {frame_selection!r}.")
     else:
