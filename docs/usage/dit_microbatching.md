@@ -5,10 +5,21 @@ Existing recipes with `micro_batch_size: 1` are unchanged. A larger microbatch
 does not automatically enable packing or guarantee a speedup: each model decides
 whether to loop over samples, batch or pack them, or reject unsupported inputs.
 
+This page describes the default, where `micro_batch_size` counts *samples*.
+Setting `train.dyn_bsz: true` on a DiT recipe switches the same trainer to
+token-budget scheduling -- `micro_batch_size` must then be 1 and samples are
+greedily packed up to `data.max_seq_len`; see
+[DiT packing](data_packing_and_dyn_bsz.md#dit-diffusion-packing). That only takes
+effect when the condition model can price a sample
+(`build_dyn_bsz_length_fn`); otherwise batching stays fixed-sample. That fallback
+logs nothing: `train.dyn_bsz` defaults to `true`, so the trainer cannot tell an
+explicit request from the shared default, and any message would fire for every DiT
+recipe that never set the field.
+
 ## Training batch sizes
 
-DiT keeps `train.dyn_bsz = false`. With microbatch size `M`, data-parallel size
-`D`, and `K` gradient-accumulation microbatches per optimizer step:
+With fixed-sample batching, DiT keeps `train.dyn_bsz = false`. With microbatch size `M`,
+data-parallel size `D`, and `K` gradient-accumulation microbatches per optimizer step:
 
 ```text
 G = M × D × K
@@ -60,8 +71,9 @@ Packing, valid-token selection, multimodal layouts, attention boundaries,
 positions and output reconstruction remain inside modeling. SP/CP slicing also
 belongs there, after patchification where applicable, not in the DiT collator.
 A model that cannot handle a multi-sample or parallel configuration must reject
-it itself. The trainer adds no packing switch, alternate sample/output protocol,
-or model-capability envelope.
+it itself. The trainer's only packing input is `train.dyn_bsz` (whether samples are
+greedily packed to a token budget, see above); the tensor-level pack and the
+sample/output protocol stay model-owned.
 
 This is fixed-sample batching, independent of the token-budget scheduling used
 by dynamic batching. A larger microbatch does not imply packing for every model.
